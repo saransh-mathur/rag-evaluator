@@ -1,0 +1,58 @@
+[
+  {
+    "id": "q1",
+    "question": "What should I use instead of time.sleep in async Python code?",
+    "question_type": "coding_async",
+    "expected_answer_contains": ["asyncio.sleep"],
+    "expected_context_contains": ["time.sleep()", "await asyncio.sleep"]
+  },
+  {
+    "id": "q2",
+    "question": "Why should you avoid blocking calls like time.sleep inside async functions?",
+    "question_type": "coding_async",
+    "expected_answer_contains": ["event loop"],
+    "expected_context_contains": ["time.sleep()", "event loop"]
+  },
+  {
+    "id": "q3",
+    "question": "What PostgreSQL index type is best for equality lookups on a single column?",
+    "question_type": "database",
+    "expected_answer_contains": ["B-tree"],
+    "expected_context_contains": ["B-tree", "equality"]
+  },
+  {
+    "id": "q4",
+    "question": "When should I use a partial index in PostgreSQL?",
+    "question_type": "database",
+    "expected_answer_contains": ["WHERE"],
+    "expected_context_contains": ["partial index", "WHERE"]
+  },
+  {
+    "id": "q5",
+    "question": "What S3 consistency model applies after a successful PUT?",
+    "question_type": "cloud",
+    "expected_answer_contains": ["read-after-write"],
+    "expected_context_contains": ["read-after-write", "PUT"]
+  },
+  {
+    "id": "q6",
+    "question": "How can I reduce S3 request costs for frequently accessed small objects?",
+    "question_type": "cloud",
+    "expected_answer_contains": ["CloudFront"],
+    "expected_context_contains": ["CloudFront", "request costs"]
+  },
+  {
+    "id": "q7",
+    "question": "What chunk overlap helps preserve context across chunk boundaries in RAG?",
+    "question_type": "rag",
+    "expected_answer_contains": ["overlap"],
+    "expected_context_contains": ["chunk overlap", "boundaries"]
+  },
+  {
+    "id": "q8",
+    "question": "Why is semantic chunking often better than fixed-size splitting for technical docs?",
+    "question_type": "rag",
+    "expected_answer_contains": ["semantic"],
+    "expected_context_contains": ["semantic chunking", "headings"]
+  }
+]

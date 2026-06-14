@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+runs/
+.vscode/
+.idea/
+requirements-lock.txt
