@@ -1,0 +1,29 @@
+# Core dependencies
+pandas>=2.2.2
+numpy>=1.26.4
+scikit-learn>=1.5.1
+openai>=1.35.10
+requests>=2.32.3
+python-dotenv>=1.0.1
+
+# Backend dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+python-multipart==0.0.6
+pydantic==2.5.0
+pgvector==0.2.4
+
+# Frontend dependencies
+streamlit>=1.36.0
+plotly>=5.22.0
+
+# Database migration
+alembic==1.12.1
+SQLAlchemy-Utils==0.41.1
+
+# Development (optional)
+pytest>=7.4.3
+black==23.12.1
+flake8==6.1.0
