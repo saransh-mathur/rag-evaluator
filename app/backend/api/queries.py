@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from db.connection import get_db
 from db.models import DocumentChunk, QueryHistory, User
-from services.generation import generate_answer, generate_answer_stream
+from services.generation import generate_answer, generate_answer_stream, generate_suggestions
 from services.retrieval import search_similar_chunks
 
 router = APIRouter(prefix="/api/queries", tags=["queries"])
@@ -366,3 +366,52 @@ async def delete_query(
     db.commit()
 
     return {"message": "Query deleted successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Follow-up suggestions
+# ---------------------------------------------------------------------------
+
+class SuggestRequest(BaseModel):
+    question: str
+    answer: str
+
+
+@router.post("/suggest")
+async def suggest_followups(req: SuggestRequest):
+    """Return up to 3 follow-up question suggestions based on a Q&A exchange."""
+    try:
+        suggestions = generate_suggestions(req.question, req.answer)
+        return {"suggestions": suggestions}
+    except Exception as e:
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Answer feedback
+# ---------------------------------------------------------------------------
+
+class FeedbackRequest(BaseModel):
+    query_id: int
+    user_id: str
+    feedback: int  # 1 = thumbs up, -1 = thumbs down
+
+
+@router.post("/feedback")
+async def submit_feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
+    """Record thumbs up / thumbs down feedback for an answer."""
+    if req.feedback not in (1, -1):
+        raise HTTPException(status_code=400, detail="feedback must be 1 or -1")
+
+    query = db.query(QueryHistory).filter(
+        QueryHistory.id == req.query_id,
+        QueryHistory.user_id == req.user_id,
+    ).first()
+
+    if not query:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    query.feedback = req.feedback
+    db.commit()
+    return {"message": "Feedback recorded", "query_id": req.query_id, "feedback": req.feedback}

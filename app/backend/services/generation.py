@@ -98,7 +98,40 @@ def generate_answer_stream(
         raise RuntimeError(f"Streaming generation failed: {e}")
 
 
-def generate_with_history(
+def generate_suggestions(
+    question: str,
+    answer: str,
+    temperature: float = 0.3,
+) -> list[str]:
+    """
+    Generate 3 follow-up question suggestions based on the Q&A exchange.
+
+    Returns a list of up to 3 question strings.
+    """
+    try:
+        client = OpenAI(base_url=GEN_BASE_URL, api_key=GEN_API_KEY)
+        prompt = (
+            "Based on the following question and answer, suggest exactly 3 concise "
+            "follow-up questions the user might want to ask next. "
+            "Return ONLY the 3 questions, one per line, no numbering, no extra text.\n\n"
+            f"Question: {question}\n\nAnswer: {answer[:800]}\n\nFollow-up questions:"
+        )
+        response = client.chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=200,
+            timeout=60,
+        )
+        raw = response.choices[0].message.content or ""
+        suggestions = [
+            line.strip().lstrip("-•·123456789.) ").strip()
+            for line in raw.strip().splitlines()
+            if line.strip() and len(line.strip()) > 5
+        ]
+        return suggestions[:3]
+    except Exception:
+        return []
     question: str,
     context: str,
     chat_history: List[dict] = None,

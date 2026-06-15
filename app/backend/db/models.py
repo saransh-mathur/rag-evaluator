@@ -57,6 +57,7 @@ class QueryHistory(Base):
     answer = Column(Text, nullable=False)
     retrieved_chunks_ids = Column(Text)  # JSON serialized list of chunk IDs
     top_similarity = Column(Float)
+    feedback = Column(Integer, nullable=True)  # 1 = thumbs up, -1 = thumbs down
     created_at = Column(DateTime, default=datetime.utcnow)
     
     user = relationship("User", back_populates="queries")
