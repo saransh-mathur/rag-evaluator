@@ -1,135 +1,186 @@
 """Query and chat API endpoints."""
 
+from __future__ import annotations
+
 import json
+import logging
 import traceback
 from typing import Iterator, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from db.connection import get_db
 from db.models import DocumentChunk, QueryHistory, User
-from services.generation import generate_answer, generate_answer_stream, generate_suggestions
+from services.generation import (
+    generate_answer,
+    generate_answer_stream,
+    generate_suggestions,
+    generate_search_autocomplete,
+)
 from services.retrieval import search_similar_chunks
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/queries", tags=["queries"])
 
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter (requests per minute per user)
+# ---------------------------------------------------------------------------
+import time
+from collections import defaultdict
+
+_rate_store: dict[str, list[float]] = defaultdict(list)
+_RATE_LIMIT = 30   # max requests per minute per user_id
+
+
+def _check_rate_limit(user_id: str) -> None:
+    now = time.time()
+    window = 60.0
+    _rate_store[user_id] = [t for t in _rate_store[user_id] if now - t < window]
+    if len(_rate_store[user_id]) >= _RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded ({_RATE_LIMIT} requests/minute). Please wait.",
+        )
+    _rate_store[user_id].append(now)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
-    """User query request."""
-    question: str
-    user_id: str
-    top_k: int = 8
-    temperature: float = 0.1
-    max_tokens: int = 2048
+    question:     str
+    user_id:      str
+    top_k:        int   = 8
+    temperature:  float = 0.1
+    max_tokens:   int   = 2048
+    doc_mode:     bool  = True    # True = use retrieved context; False = general chat
+    use_hyde:     bool  = False   # HyDE query expansion
+    use_rerank:   bool  = True    # TF-IDF re-ranking
+    chat_history: list[dict] | None = None  # multi-turn conversation context
 
 
 class QueryResponse(BaseModel):
-    """Query response with answer and sources."""
-    question: str
-    answer: str
+    question:         str
+    answer:           str
     retrieved_chunks: List[dict]
-    top_similarity: float
-    query_id: int
+    top_similarity:   float
+    query_id:         int
+    doc_mode:         bool
 
 
 class HistoryResponse(BaseModel):
-    """Query history item."""
-    id: int
-    question: str
-    answer: str
-    created_at: str
+    id:          int
+    question:    str
+    answer:      str
+    created_at:  str
     chunk_count: int
+    feedback:    int | None
+    starred:     bool
+    doc_mode:    bool
 
+
+class SuggestRequest(BaseModel):
+    question: str
+    answer:   str
+
+
+class FeedbackRequest(BaseModel):
+    query_id: int
+    user_id:  str
+    feedback: int   # 1 or -1
+
+
+class StarRequest(BaseModel):
+    query_id: int
+    user_id:  str
+    starred:  bool
+
+
+# ---------------------------------------------------------------------------
+# Shared retrieval + context builder
+# ---------------------------------------------------------------------------
+
+def _build_context_and_chunks(
+    db: Session,
+    req: QueryRequest,
+) -> tuple[str, list[dict], float]:
+    """
+    Run retrieval and build:
+      - context string (with source headers)
+      - retrieved_chunks list for the response
+      - top_similarity float
+    """
+    search_results = search_similar_chunks(
+        db,
+        query=req.question,
+        top_k=req.top_k,
+        user_id=req.user_id,
+        use_hyde=req.use_hyde,
+        use_rerank=req.use_rerank,
+        doc_mode=req.doc_mode,
+    )
+
+    retrieved_chunks: list[dict] = []
+    context_parts:    list[str]  = []
+    top_similarity = 0.0
+    total = len(search_results)
+
+    for idx, item in enumerate(search_results):
+        chunk, similarity = item if isinstance(item, tuple) else (item, 0.0)
+        filename = (
+            getattr(chunk.document, "filename", None)
+            if getattr(chunk, "document", None) else None
+        ) or "unknown"
+
+        # Contextual header prepended to each chunk
+        header = f"[Source: {filename}, chunk {chunk.chunk_index + 1}]"
+        context_parts.append(f"{header}\n{chunk.text}")
+
+        retrieved_chunks.append({
+            "chunk_id":    chunk.id,
+            "document_id": chunk.document_id,
+            "filename":    filename,
+            "text":        (chunk.text[:200] + "…") if len(chunk.text or "") > 200 else (chunk.text or ""),
+            "similarity":  round(float(similarity), 4),
+        })
+
+        if float(similarity) > top_similarity:
+            top_similarity = float(similarity)
+
+    context = "\n\n---\n\n".join(context_parts)
+    return context, retrieved_chunks, top_similarity
+
+
+def _ensure_user(db: Session, user_id: str) -> None:
+    if not db.query(User).filter(User.id == user_id).first():
+        db.add(User(id=user_id))
+        db.flush()
+
+
+# ---------------------------------------------------------------------------
+# /ask  (blocking)
+# ---------------------------------------------------------------------------
 
 @router.post("/ask", response_model=QueryResponse)
 async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
-    """
-    Process a user question and return answer with sources.
-
-    1. Ensure user exists
-    2. Search for similar chunks
-    3. Generate answer using context
-    4. Save to history
-    """
+    """Blocking question endpoint."""
     try:
-        user = db.query(User).filter(User.id == req.user_id).first()
-        if not user:
-            user = User(id=req.user_id)
-            db.add(user)
-            db.flush()
+        _check_rate_limit(req.user_id)
+        _ensure_user(db, req.user_id)
 
-        search_results = search_similar_chunks(
-            db,
-            query=req.question,
-            top_k=req.top_k,
-            user_id=req.user_id
-        )
-
-        if not search_results:
-            answer = generate_answer(
-                question=req.question,
-                context="",
-                temperature=req.temperature,
-                max_tokens=req.max_tokens,
-            )
-
-            history = QueryHistory(
-                user_id=req.user_id,
-                question=req.question,
-                answer=answer,
-                retrieved_chunks_ids=json.dumps([]),
-                top_similarity=0.0
-            )
-            db.add(history)
-            db.commit()
-            db.refresh(history)
-
-            return QueryResponse(
-                question=req.question,
-                answer=answer,
-                retrieved_chunks=[],
-                top_similarity=0.0,
-                query_id=history.id
-            )
-
-        retrieved_chunks = []
-        context_parts = []
-        top_similarity = 0.0
-
-        for item in search_results:
-            if isinstance(item, tuple) and len(item) == 2:
-                chunk, similarity = item
-            else:
-                chunk, similarity = item, 0.0
-
-            filename = None
-            if getattr(chunk, "document", None) is not None:
-                filename = getattr(chunk.document, "filename", None)
-
-            retrieved_chunks.append({
-                "chunk_id": chunk.id,
-                "document_id": chunk.document_id,
-                "filename": filename or "unknown",
-                "text": (chunk.text[:200] + "...") if chunk.text and len(chunk.text) > 200 else (chunk.text or ""),
-                "similarity": round(float(similarity), 4)
-            })
-
-            if chunk.text:
-                context_parts.append(chunk.text)
-
-            if similarity is not None and float(similarity) > top_similarity:
-                top_similarity = float(similarity)
-
-        context = "\n\n---\n\n".join(context_parts)
+        context, retrieved_chunks, top_similarity = _build_context_and_chunks(db, req)
 
         answer = generate_answer(
             question=req.question,
             context=context,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
+            chat_history=req.chat_history,
+            doc_mode=req.doc_mode,
         )
 
         retrieved_ids = [c["chunk_id"] for c in retrieved_chunks]
@@ -138,7 +189,8 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
             question=req.question,
             answer=answer,
             retrieved_chunks_ids=json.dumps(retrieved_ids),
-            top_similarity=top_similarity
+            top_similarity=top_similarity,
+            doc_mode=req.doc_mode,
         )
         db.add(history)
         db.commit()
@@ -149,105 +201,70 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
             answer=answer,
             retrieved_chunks=retrieved_chunks,
             top_similarity=top_similarity,
-            query_id=history.id
+            query_id=history.id,
+            doc_mode=req.doc_mode,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(traceback.format_exc())
+        logger.error(traceback.format_exc())
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
-# Streaming endpoint
+# /ask-stream  (SSE)
 # ---------------------------------------------------------------------------
 
 def _sse(payload: dict) -> str:
-    """Format a dict as a Server-Sent Events data line."""
     return f"data: {json.dumps(payload)}\n\n"
 
 
 @router.post("/ask-stream")
 async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
     """
-    Streaming version of /ask.
+    Streaming SSE endpoint.
 
-    SSE event sequence:
-      1. {"type": "sources", "retrieved_chunks": [...], "top_similarity": float}
-      2. {"type": "token",   "content": "<token>"}   — one per LLM token
-      3. {"type": "done",    "query_id": int}
+    Event sequence:
+      {"type":"sources",  "retrieved_chunks":[…], "top_similarity":float}
+      {"type":"token",    "content":"…"}           — one per LLM token
+      {"type":"done",     "query_id":int}
+      {"type":"error",    "detail":"…"}             — on failure
     """
+    try:
+        _check_rate_limit(req.user_id)
+    except HTTPException as e:
+        async def rate_error():
+            yield _sse({"type": "error", "detail": e.detail})
+        return StreamingResponse(rate_error(), media_type="text/event-stream")
 
     def event_stream() -> Iterator[str]:
         try:
-            # Ensure user exists
-            user = db.query(User).filter(User.id == req.user_id).first()
-            if not user:
-                db.add(User(id=req.user_id))
-                db.flush()
+            _ensure_user(db, req.user_id)
 
-            # --- Retrieval -------------------------------------------------
-            search_results = search_similar_chunks(
-                db,
-                query=req.question,
-                top_k=req.top_k,
-                user_id=req.user_id,
-            )
+            context, retrieved_chunks, top_similarity = _build_context_and_chunks(db, req)
 
-            retrieved_chunks: list[dict] = []
-            context_parts: list[str] = []
-            top_similarity = 0.0
+            yield _sse({
+                "type":             "sources",
+                "retrieved_chunks": retrieved_chunks,
+                "top_similarity":   top_similarity,
+            })
 
-            for item in search_results:
-                chunk, similarity = item if isinstance(item, tuple) else (item, 0.0)
-                filename = (
-                    getattr(chunk.document, "filename", None)
-                    if getattr(chunk, "document", None)
-                    else None
-                )
-                retrieved_chunks.append(
-                    {
-                        "chunk_id": chunk.id,
-                        "document_id": chunk.document_id,
-                        "filename": filename or "unknown",
-                        "text": (
-                            (chunk.text[:200] + "...")
-                            if chunk.text and len(chunk.text) > 200
-                            else (chunk.text or "")
-                        ),
-                        "similarity": round(float(similarity), 4),
-                    }
-                )
-                if chunk.text:
-                    context_parts.append(chunk.text)
-                if similarity is not None and float(similarity) > top_similarity:
-                    top_similarity = float(similarity)
-
-            # Fire sources event immediately so the UI can show them
-            yield _sse(
-                {
-                    "type": "sources",
-                    "retrieved_chunks": retrieved_chunks,
-                    "top_similarity": top_similarity,
-                }
-            )
-
-            context = "\n\n---\n\n".join(context_parts)
-
-            # --- Streaming generation --------------------------------------
-            full_answer_parts: list[str] = []
+            full_parts: list[str] = []
             for token in generate_answer_stream(
                 question=req.question,
                 context=context,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
+                chat_history=req.chat_history,
+                doc_mode=req.doc_mode,
             ):
-                full_answer_parts.append(token)
+                full_parts.append(token)
                 yield _sse({"type": "token", "content": token})
 
-            full_answer = "".join(full_answer_parts)
+            full_answer = "".join(full_parts)
 
-            # --- Persist history -------------------------------------------
             retrieved_ids = [c["chunk_id"] for c in retrieved_chunks]
             history = QueryHistory(
                 user_id=req.user_id,
@@ -255,6 +272,7 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
                 answer=full_answer,
                 retrieved_chunks_ids=json.dumps(retrieved_ids),
                 top_similarity=top_similarity,
+                doc_mode=req.doc_mode,
             )
             db.add(history)
             db.commit()
@@ -263,35 +281,32 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
             yield _sse({"type": "done", "query_id": history.id})
 
         except Exception:
-            print(traceback.format_exc())
+            logger.error(traceback.format_exc())
             db.rollback()
             yield _sse({"type": "error", "detail": "Streaming generation failed"})
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering if proxied
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
 
 @router.get("/history")
 async def get_query_history(
     user_id: str,
-    limit: int = 50,
-    db: Session = Depends(get_db)
+    limit:   int  = 50,
+    starred: bool = False,
+    db: Session = Depends(get_db),
 ) -> List[HistoryResponse]:
-    """Get query history for a user."""
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id required")
-
-    queries = db.query(QueryHistory).filter(
-        QueryHistory.user_id == user_id
-    ).order_by(
-        QueryHistory.created_at.desc()
-    ).limit(limit).all()
+    q = db.query(QueryHistory).filter(QueryHistory.user_id == user_id)
+    if starred:
+        q = q.filter(QueryHistory.starred == True)
+    queries = q.order_by(QueryHistory.created_at.desc()).limit(limit).all()
 
     return [
         HistoryResponse(
@@ -299,119 +314,124 @@ async def get_query_history(
             question=q.question,
             answer=q.answer,
             created_at=q.created_at.isoformat(),
-            chunk_count=len(json.loads(q.retrieved_chunks_ids or "[]"))
+            chunk_count=len(json.loads(q.retrieved_chunks_ids or "[]")),
+            feedback=q.feedback,
+            starred=bool(q.starred),
+            doc_mode=bool(q.doc_mode),
         )
         for q in queries
     ]
 
 
 @router.get("/history/{query_id}")
-async def get_query_detail(
-    query_id: int,
-    db: Session = Depends(get_db)
-):
-    """Get detailed view of a specific query with all chunk info."""
-    query = db.query(QueryHistory).filter(
-        QueryHistory.id == query_id
-    ).first()
-
+async def get_query_detail(query_id: int, db: Session = Depends(get_db)):
+    query = db.query(QueryHistory).filter(QueryHistory.id == query_id).first()
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
 
     chunk_ids = json.loads(query.retrieved_chunks_ids or "[]")
-
     chunks = (
-        db.query(DocumentChunk).filter(
-            DocumentChunk.id.in_(chunk_ids)
-        ).all()
+        db.query(DocumentChunk).filter(DocumentChunk.id.in_(chunk_ids)).all()
         if chunk_ids else []
     )
 
     return {
-        "id": query.id,
+        "id":       query.id,
         "question": query.question,
-        "answer": query.answer,
+        "answer":   query.answer,
         "created_at": query.created_at.isoformat(),
+        "feedback": query.feedback,
+        "starred":  query.starred,
+        "doc_mode": query.doc_mode,
         "retrieved_chunks": [
             {
-                "chunk_id": c.id,
-                "filename": c.document.filename if getattr(c, "document", None) else "unknown",
-                "text": c.text,
-                "chunk_index": c.chunk_index
+                "chunk_id":    c.id,
+                "filename":    c.document.filename if getattr(c, "document", None) else "unknown",
+                "text":        c.text,
+                "chunk_index": c.chunk_index,
             }
             for c in chunks
-        ]
+        ],
     }
 
 
 @router.delete("/history/{query_id}")
-async def delete_query(
-    query_id: int,
-    user_id: str = None,
-    db: Session = Depends(get_db)
-):
-    """Delete a query from history."""
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id required")
-
-    query = db.query(QueryHistory).filter(
-        QueryHistory.id == query_id,
-        QueryHistory.user_id == user_id
+async def delete_query(query_id: int, user_id: str, db: Session = Depends(get_db)):
+    q = db.query(QueryHistory).filter(
+        QueryHistory.id == query_id, QueryHistory.user_id == user_id
     ).first()
-
-    if not query:
+    if not q:
         raise HTTPException(status_code=404, detail="Query not found")
-
-    db.delete(query)
+    db.delete(q)
     db.commit()
-
-    return {"message": "Query deleted successfully"}
+    return {"message": "Query deleted"}
 
 
 # ---------------------------------------------------------------------------
-# Follow-up suggestions
+# Suggestions
 # ---------------------------------------------------------------------------
-
-class SuggestRequest(BaseModel):
-    question: str
-    answer: str
-
 
 @router.post("/suggest")
 async def suggest_followups(req: SuggestRequest):
-    """Return up to 3 follow-up question suggestions based on a Q&A exchange."""
     try:
-        suggestions = generate_suggestions(req.question, req.answer)
-        return {"suggestions": suggestions}
+        return {"suggestions": generate_suggestions(req.question, req.answer)}
     except Exception as e:
-        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
-# Answer feedback
+# Feedback
 # ---------------------------------------------------------------------------
-
-class FeedbackRequest(BaseModel):
-    query_id: int
-    user_id: str
-    feedback: int  # 1 = thumbs up, -1 = thumbs down
-
 
 @router.post("/feedback")
 async def submit_feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
-    """Record thumbs up / thumbs down feedback for an answer."""
     if req.feedback not in (1, -1):
         raise HTTPException(status_code=400, detail="feedback must be 1 or -1")
-
-    query = db.query(QueryHistory).filter(
-        QueryHistory.id == req.query_id,
-        QueryHistory.user_id == req.user_id,
+    q = db.query(QueryHistory).filter(
+        QueryHistory.id == req.query_id, QueryHistory.user_id == req.user_id
     ).first()
-
-    if not query:
+    if not q:
         raise HTTPException(status_code=404, detail="Query not found")
-
-    query.feedback = req.feedback
+    q.feedback = req.feedback
     db.commit()
-    return {"message": "Feedback recorded", "query_id": req.query_id, "feedback": req.feedback}
+    return {"message": "Feedback recorded"}
+
+
+# ---------------------------------------------------------------------------
+# Star / pin
+# ---------------------------------------------------------------------------
+
+@router.post("/star")
+async def star_query(req: StarRequest, db: Session = Depends(get_db)):
+    q = db.query(QueryHistory).filter(
+        QueryHistory.id == req.query_id, QueryHistory.user_id == req.user_id
+    ).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Query not found")
+    q.starred = req.starred
+    db.commit()
+    return {"message": "Star updated", "starred": req.starred}
+
+
+# ---------------------------------------------------------------------------
+# Autocomplete
+# ---------------------------------------------------------------------------
+
+@router.get("/autocomplete")
+async def autocomplete(
+    user_id: str,
+    q:       str,
+    db:      Session = Depends(get_db),
+):
+    """Return up to 5 past question completions matching partial input."""
+    if len(q) < 2:
+        return {"suggestions": []}
+    past = [
+        row.question
+        for row in db.query(QueryHistory.question)
+        .filter(QueryHistory.user_id == user_id)
+        .order_by(QueryHistory.created_at.desc())
+        .limit(200)
+        .all()
+    ]
+    return {"suggestions": generate_search_autocomplete(q, past)}

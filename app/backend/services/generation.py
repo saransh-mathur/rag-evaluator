@@ -1,69 +1,133 @@
 """LLM generation service using Ollama."""
 
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+from typing import Iterator, List
+
 from openai import OpenAI
-from typing import List, Iterator
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 GEN_BASE_URL = os.getenv("GEN_BASE_URL", "http://localhost:11434/v1")
-GEN_MODEL = os.getenv("GEN_MODEL", "deepseek-r1:7b")
-GEN_API_KEY = os.getenv("GEN_API_KEY", "ollama")
+GEN_MODEL    = os.getenv("GEN_MODEL",     "deepseek-r1:7b")
+GEN_API_KEY  = os.getenv("GEN_API_KEY",   "ollama")
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _client() -> OpenAI:
+    return OpenAI(base_url=GEN_BASE_URL, api_key=GEN_API_KEY)
 
 
-def _build_prompt(question: str, context: str) -> str:
-    has_context = bool(context and context.strip())
-    if has_context:
-        return (
-            "You are a knowledgeable assistant. Your job is to give thorough, "
-            "well-structured answers based on the provided context.\n\n"
-            "Guidelines:\n"
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>…</think> reasoning blocks emitted by deepseek-r1."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _dynamic_max_tokens(question: str, requested: int) -> int:
+    """
+    Adjust max_tokens based on question complexity.
+    Short factual questions rarely need 2048 tokens.
+    """
+    q = question.strip()
+    if len(q) < 40 and not any(kw in q.lower() for kw in (
+        "explain", "describe", "how", "why", "summarize", "detail", "compare"
+    )):
+        return min(requested, 512)
+    if len(q) > 120 or any(kw in q.lower() for kw in (
+        "explain", "in depth", "step by step", "comprehensive", "detailed"
+    )):
+        return min(requested, 4096)
+    return requested
+
+
+def _build_context_header(chunk_index: int, filename: str, total: int) -> str:
+    return f"[Source: {filename}, chunk {chunk_index + 1} of {total}]"
+
+
+def _build_prompt(
+    question: str,
+    context: str,
+    chat_history: list[dict] | None = None,
+    doc_mode: bool = True,
+) -> list[dict]:
+    """
+    Build the messages list for the OpenAI-compatible API.
+
+    Returns a list of role/content dicts.
+    """
+    if doc_mode and context.strip():
+        system = (
+            "You are a knowledgeable assistant. Give thorough, well-structured answers "
+            "based on the provided context. Guidelines:\n"
             "- Answer in as much detail as the context supports\n"
             "- Use bullet points, numbered lists, or headers where they aid clarity\n"
-            "- Quote or reference specific parts of the context when relevant\n"
-            "- If the context only partially answers the question, answer what you can "
-            "and clearly state what is not covered\n"
-            "- Do not fabricate information not present in the context\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {question}\n\nAnswer:"
+            "- Start with a one-sentence TL;DR, then elaborate\n"
+            "- Quote or reference source labels when relevant\n"
+            "- If context only partially answers, state what is and isn't covered\n"
+            "- Do not fabricate information not present in the context"
         )
+        user_content = f"Context:\n{context}\n\nQuestion: {question}"
     else:
-        return (
-            "You are a knowledgeable assistant. Answer the following question as "
-            "thoroughly and clearly as possible.\n\n"
-            f"Question: {question}\n\nAnswer:"
+        system = (
+            "You are a knowledgeable assistant. Answer thoroughly and clearly. "
+            "Use structure (headers, bullets) where it aids understanding."
         )
+        user_content = question
 
+    messages: list[dict] = [{"role": "system", "content": system}]
+
+    if chat_history:
+        # Keep last 6 turns to avoid context overflow
+        messages.extend(chat_history[-6:])
+
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def generate_answer(
     question: str,
     context: str,
     temperature: float = 0.1,
     max_tokens: int = 2048,
+    chat_history: list[dict] | None = None,
+    doc_mode: bool = True,
 ) -> str:
     """
-    Generate an answer using local LLM based on context.
+    Generate a complete answer (non-streaming).
 
     Args:
-        question: User question
-        context: Retrieved context chunks
-        temperature: LLM temperature (0 = deterministic, 1 = creative)
-        max_tokens: Maximum tokens to generate (default 2048)
+        question:     User question
+        context:      Retrieved context chunks with headers
+        temperature:  LLM temperature
+        max_tokens:   Upper bound on tokens to generate
+        chat_history: Previous turns for multi-turn conversations
+        doc_mode:     If True, constrain answer to context
 
     Returns:
-        Generated answer string
+        Clean answer string (think-tags stripped)
     """
     try:
-        client = OpenAI(base_url=GEN_BASE_URL, api_key=GEN_API_KEY)
-        response = client.chat.completions.create(
+        effective_tokens = _dynamic_max_tokens(question, max_tokens)
+        messages = _build_prompt(question, context, chat_history, doc_mode)
+        response = _client().chat.completions.create(
             model=GEN_MODEL,
-            messages=[{"role": "user", "content": _build_prompt(question, context)}],
+            messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_tokens,
             timeout=180,
         )
-        return response.choices[0].message.content or ""
+        raw = response.choices[0].message.content or ""
+        return _strip_think_tags(raw)
     except Exception as e:
         raise RuntimeError(f"Generation failed: {e}")
 
@@ -73,29 +137,109 @@ def generate_answer_stream(
     context: str,
     temperature: float = 0.1,
     max_tokens: int = 2048,
+    chat_history: list[dict] | None = None,
+    doc_mode: bool = True,
 ) -> Iterator[str]:
     """
-    Stream answer tokens from the local LLM.
+    Stream answer tokens, with think-tag filtering applied on-the-fly.
 
-    Yields individual text delta strings as they arrive from the model.
-    Raises RuntimeError on connection or API failure.
+    Yields clean text delta strings.
     """
     try:
-        client = OpenAI(base_url=GEN_BASE_URL, api_key=GEN_API_KEY)
-        stream = client.chat.completions.create(
+        effective_tokens = _dynamic_max_tokens(question, max_tokens)
+        messages = _build_prompt(question, context, chat_history, doc_mode)
+        stream = _client().chat.completions.create(
             model=GEN_MODEL,
-            messages=[{"role": "user", "content": _build_prompt(question, context)}],
+            messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_tokens,
             stream=True,
             timeout=180,
         )
+
+        # Buffer to handle think-tag stripping across chunk boundaries
+        buffer = ""
+        in_think = False
         for chunk in stream:
             delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+            if not delta:
+                continue
+            buffer += delta
+
+            # Strip complete <think>…</think> blocks
+            while True:
+                if in_think:
+                    end = buffer.find("</think>")
+                    if end == -1:
+                        buffer = ""  # still inside think block, discard
+                        break
+                    buffer = buffer[end + len("</think>"):].lstrip("\n")
+                    in_think = False
+                else:
+                    start = buffer.find("<think>")
+                    if start == -1:
+                        break
+                    # Yield content before the think tag
+                    if start > 0:
+                        yield buffer[:start]
+                    buffer = buffer[start + len("<think>"):]
+                    in_think = True
+
+            if not in_think and buffer:
+                yield buffer
+                buffer = ""
+
+        # Yield any remaining buffer content
+        if buffer and not in_think:
+            yield buffer
+
     except Exception as e:
         raise RuntimeError(f"Streaming generation failed: {e}")
+
+
+def generate_hypothetical_document(question: str) -> str:
+    """
+    HyDE: Generate a hypothetical document that would answer the question.
+    Used to improve embedding-based retrieval for vague queries.
+    """
+    try:
+        prompt = (
+            "Write a short, factual passage (2-4 sentences) that would directly "
+            f"answer the following question:\n\n{question}\n\nPassage:"
+        )
+        response = _client().chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=256,
+            timeout=60,
+        )
+        return _strip_think_tags(response.choices[0].message.content or "")
+    except Exception:
+        return question  # fall back to original query
+
+
+def generate_document_summary(text: str, filename: str) -> str:
+    """
+    Generate a 2-3 sentence summary of a document for display in the UI.
+    """
+    try:
+        snippet = text[:3000]
+        prompt = (
+            f"Summarize the following document '{filename}' in 2-3 sentences. "
+            "Be specific about the main topics covered.\n\n"
+            f"Document:\n{snippet}\n\nSummary:"
+        )
+        response = _client().chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=150,
+            timeout=60,
+        )
+        return _strip_think_tags(response.choices[0].message.content or "")
+    except Exception:
+        return ""
 
 
 def generate_suggestions(
@@ -105,71 +249,39 @@ def generate_suggestions(
 ) -> list[str]:
     """
     Generate 3 follow-up question suggestions based on the Q&A exchange.
-
-    Returns a list of up to 3 question strings.
     """
     try:
-        client = OpenAI(base_url=GEN_BASE_URL, api_key=GEN_API_KEY)
         prompt = (
             "Based on the following question and answer, suggest exactly 3 concise "
             "follow-up questions the user might want to ask next. "
             "Return ONLY the 3 questions, one per line, no numbering, no extra text.\n\n"
             f"Question: {question}\n\nAnswer: {answer[:800]}\n\nFollow-up questions:"
         )
-        response = client.chat.completions.create(
+        response = _client().chat.completions.create(
             model=GEN_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=200,
             timeout=60,
         )
-        raw = response.choices[0].message.content or ""
-        suggestions = [
+        raw = _strip_think_tags(response.choices[0].message.content or "")
+        return [
             line.strip().lstrip("-•·123456789.) ").strip()
             for line in raw.strip().splitlines()
             if line.strip() and len(line.strip()) > 5
-        ]
-        return suggestions[:3]
+        ][:3]
     except Exception:
         return []
-    question: str,
-    context: str,
-    chat_history: List[dict] = None,
-    temperature: float = 0.1
-) -> str:
+
+
+def generate_search_autocomplete(partial: str, past_questions: list[str]) -> list[str]:
     """
-    Generate answer with chat history (multi-turn conversation).
-
-    Args:
-        question: Current question
-        context: Retrieved context
-        chat_history: Previous messages [{"role": "user"/"assistant", "content": "..."}]
-        temperature: LLM temperature
-
-    Returns:
-        Generated answer string
+    Return up to 5 autocomplete suggestions based on partial input and past questions.
+    Pure string matching — no LLM call needed.
     """
-    try:
-        client = OpenAI(base_url=GEN_BASE_URL, api_key=GEN_API_KEY)
-
-        system_prompt = (
-            "You are a helpful AI assistant. Answer the user's questions using the "
-            "provided context. If context doesn't contain the answer, say you don't know."
-        )
-        messages = [{"role": "system", "content": system_prompt}]
-
-        if chat_history:
-            messages.extend(chat_history)
-
-        messages.append({"role": "user", "content": f"Context:\n{context}"})
-        messages.append({"role": "user", "content": question})
-
-        response = client.chat.completions.create(
-            model=GEN_MODEL,
-            messages=messages,
-            temperature=temperature,
-            timeout=180,
-        )
-        return response.choices[0].message.content or ""
-    except Exception as e:
-        raise RuntimeError(f"Generation failed: {e}")
+    partial_lower = partial.lower()
+    matches = [
+        q for q in past_questions
+        if partial_lower in q.lower() and q.lower() != partial_lower
+    ]
+    return matches[:5]
