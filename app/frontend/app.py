@@ -113,6 +113,7 @@ def stream_question(
     question: str,
     top_k: int,
     temperature: float,
+    max_tokens: int = 2048,
 ):
     """
     Call POST /api/queries/ask-stream and yield tokens as they arrive.
@@ -125,6 +126,7 @@ def stream_question(
         "user_id": st.session_state.user_id,
         "top_k": top_k,
         "temperature": temperature,
+        "max_tokens": max_tokens,
     }
 
     # Reset pending state
@@ -165,7 +167,7 @@ def stream_question(
 # Layout
 # ---------------------------------------------------------------------------
 st.title("🤖 RAG AI Chat Assistant")
-st.caption(f"Session: {st.session_state.user_id[:8]}...")
+st.caption(f"Session ID: `{st.session_state.user_id[:8]}...`  — documents and history are scoped to this session")
 
 col1, col2 = st.columns([2, 1])
 
@@ -205,8 +207,9 @@ with col2:
 
     st.divider()
     st.subheader("⚙️ Settings")
-    top_k = st.slider("Chunks to retrieve", 1, 10, 5)
+    top_k = st.slider("Chunks to retrieve", 1, 10, 8)
     temperature = st.slider("Response creativity", 0.0, 1.0, 0.1, step=0.05)
+    max_tokens = st.slider("Max response length (tokens)", 256, 4096, 2048, step=256)
 
 # ── Left column: chat ───────────────────────────────────────────────────────
 with col1:
@@ -248,7 +251,7 @@ with col1:
             try:
                 # st.write_stream consumes our generator and renders tokens live
                 full_answer = st.write_stream(
-                    stream_question(user_input, top_k=top_k, temperature=temperature)
+                    stream_question(user_input, top_k=top_k, temperature=temperature, max_tokens=max_tokens)
                 )
             except Exception as e:
                 full_answer = f"⚠️ Error: {e}"
@@ -267,10 +270,16 @@ with col1:
         st.rerun()
 
     # Action buttons
-    col_clear, col_hist = st.columns(2)
+    col_clear, col_new, col_hist = st.columns(3)
     with col_clear:
-        if st.button("🗑️ Clear Chat", use_container_width=True):
+        if st.button("🗑️ Clear Chat", use_container_width=True, help="Clear messages but keep your documents"):
             st.session_state.messages = []
+            st.rerun()
+    with col_new:
+        if st.button("🆕 New Session", use_container_width=True, help="Start fresh — new user ID, clears chat (documents stay in DB)"):
+            st.session_state.user_id = str(uuid.uuid4())
+            st.session_state.messages = []
+            st.session_state.documents = []
             st.rerun()
     with col_hist:
         if st.button("📜 Show History", use_container_width=True):

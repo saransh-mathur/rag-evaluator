@@ -13,19 +13,34 @@ GEN_API_KEY = os.getenv("GEN_API_KEY", "ollama")
 
 
 def _build_prompt(question: str, context: str) -> str:
-    return (
-        "You are a helpful AI assistant. Answer the user's question using ONLY "
-        "the provided context. If the context does not contain enough information "
-        "to answer the question, politely say you don't know.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n\nAnswer:"
-    )
+    has_context = bool(context and context.strip())
+    if has_context:
+        return (
+            "You are a knowledgeable assistant. Your job is to give thorough, "
+            "well-structured answers based on the provided context.\n\n"
+            "Guidelines:\n"
+            "- Answer in as much detail as the context supports\n"
+            "- Use bullet points, numbered lists, or headers where they aid clarity\n"
+            "- Quote or reference specific parts of the context when relevant\n"
+            "- If the context only partially answers the question, answer what you can "
+            "and clearly state what is not covered\n"
+            "- Do not fabricate information not present in the context\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {question}\n\nAnswer:"
+        )
+    else:
+        return (
+            "You are a knowledgeable assistant. Answer the following question as "
+            "thoroughly and clearly as possible.\n\n"
+            f"Question: {question}\n\nAnswer:"
+        )
 
 
 def generate_answer(
     question: str,
     context: str,
-    temperature: float = 0.1
+    temperature: float = 0.1,
+    max_tokens: int = 2048,
 ) -> str:
     """
     Generate an answer using local LLM based on context.
@@ -34,6 +49,7 @@ def generate_answer(
         question: User question
         context: Retrieved context chunks
         temperature: LLM temperature (0 = deterministic, 1 = creative)
+        max_tokens: Maximum tokens to generate (default 2048)
 
     Returns:
         Generated answer string
@@ -44,6 +60,7 @@ def generate_answer(
             model=GEN_MODEL,
             messages=[{"role": "user", "content": _build_prompt(question, context)}],
             temperature=temperature,
+            max_tokens=max_tokens,
             timeout=180,
         )
         return response.choices[0].message.content or ""
@@ -55,6 +72,7 @@ def generate_answer_stream(
     question: str,
     context: str,
     temperature: float = 0.1,
+    max_tokens: int = 2048,
 ) -> Iterator[str]:
     """
     Stream answer tokens from the local LLM.
@@ -68,6 +86,7 @@ def generate_answer_stream(
             model=GEN_MODEL,
             messages=[{"role": "user", "content": _build_prompt(question, context)}],
             temperature=temperature,
+            max_tokens=max_tokens,
             stream=True,
             timeout=180,
         )

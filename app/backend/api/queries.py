@@ -21,8 +21,9 @@ class QueryRequest(BaseModel):
     """User query request."""
     question: str
     user_id: str
-    top_k: int = 5
+    top_k: int = 8
     temperature: float = 0.1
+    max_tokens: int = 2048
 
 
 class QueryResponse(BaseModel):
@@ -71,7 +72,8 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
             answer = generate_answer(
                 question=req.question,
                 context="",
-                temperature=req.temperature
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
             )
 
             history = QueryHistory(
@@ -126,7 +128,8 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
         answer = generate_answer(
             question=req.question,
             context=context,
-            temperature=req.temperature
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
         )
 
         retrieved_ids = [c["chunk_id"] for c in retrieved_chunks]
@@ -237,6 +240,7 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
                 question=req.question,
                 context=context,
                 temperature=req.temperature,
+                max_tokens=req.max_tokens,
             ):
                 full_answer_parts.append(token)
                 yield _sse({"type": "token", "content": token})
