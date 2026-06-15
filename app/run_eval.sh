@@ -5,7 +5,7 @@ source .venv/bin/activate
 set -a
 source .env
 set +a
-python src/evaluate_rag.py \
+PYTHONDONTWRITEBYTECODE=1 python src/evaluate_rag.py \
   --docs-dir data/sample_docs \
   --tests-file data/test_cases.json \
   --output-dir runs/latest \

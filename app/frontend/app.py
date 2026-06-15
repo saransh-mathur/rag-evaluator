@@ -1,36 +1,41 @@
 """Main Streamlit RAG AI chat application."""
 
-import streamlit as st
-import requests
 import json
-from datetime import datetime
 import uuid
 
-# Configuration
-API_BASE_URL = "http://localhost:8000/api"
-TIMEOUT = 60
+import requests
+import streamlit as st
 
-# Page config
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+API_BASE_URL = "http://localhost:8000/api"
+TIMEOUT = 60          # used for all non-streaming requests
+STREAM_TIMEOUT = 300  # seconds; streaming can take a while on CPU
+
+# ---------------------------------------------------------------------------
+# Page setup
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="RAG AI Chat",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Styling
-st.markdown("""
+st.markdown(
+    """
     <style>
-    .main {
-        padding: 0rem 1rem;
-    }
-    .stChatMessage {
-        padding: 1rem;
-    }
+    .main { padding: 0rem 1rem; }
+    .stChatMessage { padding: 1rem; }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-# Initialize session state
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
 if "user_id" not in st.session_state:
     st.session_state.user_id = str(uuid.uuid4())
 
@@ -41,51 +46,48 @@ if "documents" not in st.session_state:
     st.session_state.documents = []
 
 
-def load_documents():
-    """Load user's documents from API."""
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+
+def load_documents() -> list:
     try:
-        response = requests.get(
+        r = requests.get(
             f"{API_BASE_URL}/documents/list",
             params={"user_id": st.session_state.user_id},
-            timeout=TIMEOUT
+            timeout=TIMEOUT,
         )
-        response.raise_for_status()
-        st.session_state.documents = response.json()
+        r.raise_for_status()
+        st.session_state.documents = r.json()
         return st.session_state.documents
     except Exception as e:
         st.error(f"Failed to load documents: {e}")
         return []
 
 
-def upload_document(uploaded_file):
-    """Upload a document to the API."""
+def upload_document(uploaded_file) -> dict | None:
     try:
-        files = {"file": uploaded_file}
-        params = {"user_id": st.session_state.user_id}
-        
-        response = requests.post(
+        r = requests.post(
             f"{API_BASE_URL}/documents/upload",
-            files=files,
-            params=params,
-            timeout=TIMEOUT
+            files={"file": uploaded_file},
+            params={"user_id": st.session_state.user_id},
+            timeout=TIMEOUT,
         )
-        response.raise_for_status()
-        result = response.json()
-        return result
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
         st.error(f"Upload failed: {e}")
         return None
 
 
-def delete_document(doc_id):
-    """Delete a document."""
+def delete_document(doc_id: int) -> bool:
     try:
-        response = requests.delete(
+        r = requests.delete(
             f"{API_BASE_URL}/documents/{doc_id}",
             params={"user_id": st.session_state.user_id},
-            timeout=TIMEOUT
+            timeout=TIMEOUT,
         )
-        response.raise_for_status()
+        r.raise_for_status()
         load_documents()
         return True
     except Exception as e:
@@ -93,166 +95,200 @@ def delete_document(doc_id):
         return False
 
 
-def ask_question(question, top_k=5, temperature=0.1):
-    """Send a question to the API and get answer."""
+def get_query_history() -> list:
     try:
-        payload = {
-            "question": question,
-            "user_id": st.session_state.user_id,
-            "top_k": top_k,
-            "temperature": temperature
-        }
-        
-        response = requests.post(
-            f"{API_BASE_URL}/queries/ask",
-            json=payload,
-            timeout=TIMEOUT
-        )
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        st.error(f"Query failed: {e}")
-        return None
-
-
-def get_query_history():
-    """Get query history from API."""
-    try:
-        response = requests.get(
+        r = requests.get(
             f"{API_BASE_URL}/queries/history",
             params={"user_id": st.session_state.user_id, "limit": 20},
-            timeout=TIMEOUT
+            timeout=TIMEOUT,
         )
-        response.raise_for_status()
-        return response.json()
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
         st.error(f"Failed to load history: {e}")
         return []
 
 
-# Main UI
+def stream_question(
+    question: str,
+    top_k: int,
+    temperature: float,
+):
+    """
+    Call POST /api/queries/ask-stream and yield tokens as they arrive.
+
+    Also captures the sources and query_id from the SSE envelope and
+    stores them in st.session_state for display after streaming ends.
+    """
+    payload = {
+        "question": question,
+        "user_id": st.session_state.user_id,
+        "top_k": top_k,
+        "temperature": temperature,
+    }
+
+    # Reset pending state
+    st.session_state["_pending_chunks"] = []
+    st.session_state["_pending_similarity"] = 0.0
+    st.session_state["_pending_query_id"] = None
+
+    with requests.post(
+        f"{API_BASE_URL}/queries/ask-stream",
+        json=payload,
+        stream=True,
+        timeout=STREAM_TIMEOUT,
+    ) as resp:
+        resp.raise_for_status()
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data: "):
+                continue
+            event = json.loads(line[len("data: "):])
+
+            if event["type"] == "sources":
+                st.session_state["_pending_chunks"] = event["retrieved_chunks"]
+                st.session_state["_pending_similarity"] = event["top_similarity"]
+
+            elif event["type"] == "token":
+                yield event["content"]
+
+            elif event["type"] == "done":
+                st.session_state["_pending_query_id"] = event["query_id"]
+
+            elif event["type"] == "error":
+                raise RuntimeError(event.get("detail", "Unknown streaming error"))
+
+
+# ---------------------------------------------------------------------------
+# Layout
+# ---------------------------------------------------------------------------
 st.title("🤖 RAG AI Chat Assistant")
 st.caption(f"Session: {st.session_state.user_id[:8]}...")
 
-# Create columns for layout
 col1, col2 = st.columns([2, 1])
 
+# ── Right column: documents + settings ─────────────────────────────────────
 with col2:
-    # Sidebar for documents
     st.header("📁 Documents")
-    
+
     uploaded_file = st.file_uploader(
         "Upload a document",
         type=["pdf", "txt", "md"],
-        key="doc_uploader"
+        key="doc_uploader",
     )
-    
     if uploaded_file:
-        with st.spinner("Uploading..."):
+        with st.spinner("Uploading and embedding…"):
             result = upload_document(uploaded_file)
             if result:
-                st.success(f"✅ Uploaded: {result['filename']}\n({result['chunks_created']} chunks)")
+                st.success(
+                    f"✅ {result['filename']} — {result['chunks_created']} chunks"
+                )
                 load_documents()
-    
+
     st.divider()
-    
-    # Document list
     st.subheader("Your Documents")
     docs = load_documents()
-    
+
     if docs:
         for doc in docs:
-            col_doc, col_del = st.columns([4, 1])
-            with col_doc:
-                st.caption(f"📄 {doc['filename']}\n({doc['chunks']} chunks)")
-            with col_del:
+            c_doc, c_del = st.columns([4, 1])
+            with c_doc:
+                st.caption(f"📄 {doc['filename']}  ({doc['chunks']} chunks)")
+            with c_del:
                 if st.button("🗑️", key=f"del_{doc['id']}", help="Delete"):
                     delete_document(doc["id"])
                     st.rerun()
     else:
         st.info("No documents yet. Upload one to get started!")
-    
-    st.divider()
-    
-    # Settings
-    st.subheader("⚙️ Settings")
-    top_k = st.slider("Results to retrieve", 1, 10, 5)
-    temperature = st.slider("Response creativity", 0.0, 1.0, 0.1)
 
-with col1:
-    # Chat interface
-    st.header("💬 Chat")
-    
-    # Display messages
-    chat_container = st.container(height=400, border=True)
-    with chat_container:
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-                if message["role"] == "assistant" and "chunks" in message:
-                    with st.expander("📚 Sources"):
-                        for chunk in message["chunks"]:
-                            st.caption(f"**{chunk['filename']}** (sim: {chunk['similarity']})")
-                            st.text(chunk['text'][:300] + "...")
-    
-    # Input
     st.divider()
-    
+    st.subheader("⚙️ Settings")
+    top_k = st.slider("Chunks to retrieve", 1, 10, 5)
+    temperature = st.slider("Response creativity", 0.0, 1.0, 0.1, step=0.05)
+
+# ── Left column: chat ───────────────────────────────────────────────────────
+with col1:
+    st.header("💬 Chat")
+
+    # Message history display
+    chat_container = st.container(height=420, border=True)
+    with chat_container:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg["role"] == "assistant" and msg.get("chunks"):
+                    with st.expander("📚 Sources"):
+                        for chunk in msg["chunks"]:
+                            st.caption(
+                                f"**{chunk['filename']}**  sim: {chunk['similarity']}"
+                            )
+                            st.text(chunk["text"])
+
+    st.divider()
+
+    # Input row
     col_input, col_send = st.columns([5, 1])
     with col_input:
         user_input = st.text_input(
-            "Ask me anything...",
+            "Ask me anything…",
             placeholder="Type your question here",
             label_visibility="collapsed",
-            key="user_input"
+            key="user_input",
         )
-    
     with col_send:
         send_button = st.button("Send", key="send_btn", use_container_width=True)
-    
-    # Process input
+
+    # Process submission
     if send_button and user_input:
-        # Add user message
-        st.session_state.messages.append({
-            "role": "user",
-            "content": user_input
-        })
-        
-        with st.spinner("🤔 Thinking..."):
-            result = ask_question(user_input, top_k=top_k, temperature=temperature)
-            
-            if result:
-                # Add assistant message
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": result["answer"],
-                    "chunks": result["retrieved_chunks"],
-                    "similarity": result["top_similarity"]
-                })
-                
-                st.rerun()
-    
-    # Clear chat button
-    col_clear, col_history = st.columns(2)
+        st.session_state.messages.append({"role": "user", "content": user_input})
+
+        with st.chat_message("assistant"):
+            try:
+                # st.write_stream consumes our generator and renders tokens live
+                full_answer = st.write_stream(
+                    stream_question(user_input, top_k=top_k, temperature=temperature)
+                )
+            except Exception as e:
+                full_answer = f"⚠️ Error: {e}"
+                st.error(full_answer)
+
+        # Persist the complete message (with sources) into session state
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": full_answer,
+                "chunks": st.session_state.pop("_pending_chunks", []),
+                "similarity": st.session_state.pop("_pending_similarity", 0.0),
+                "query_id": st.session_state.pop("_pending_query_id", None),
+            }
+        )
+        st.rerun()
+
+    # Action buttons
+    col_clear, col_hist = st.columns(2)
     with col_clear:
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
-    
-    with col_history:
+    with col_hist:
         if st.button("📜 Show History", use_container_width=True):
-            st.session_state.show_history = not st.session_state.get("show_history", False)
+            st.session_state.show_history = not st.session_state.get(
+                "show_history", False
+            )
 
-# Show history in expander
+# ---------------------------------------------------------------------------
+# Query history panel
+# ---------------------------------------------------------------------------
 if st.session_state.get("show_history", False):
     st.divider()
     st.subheader("📜 Query History")
-    
     history = get_query_history()
     if history:
-        for query in history:
-            with st.expander(f"Q: {query['question'][:50]}... ({query['created_at'][:10]})"):
-                st.write(f"**Answer:** {query['answer'][:200]}...")
-                st.caption(f"Sources: {query['chunk_count']} chunks retrieved")
+        for q in history:
+            with st.expander(f"Q: {q['question'][:60]}… ({q['created_at'][:10]})"):
+                st.write(f"**Answer:** {q['answer'][:300]}…")
+                st.caption(f"{q['chunk_count']} chunks retrieved")
     else:
         st.info("No query history yet.")

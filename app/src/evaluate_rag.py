@@ -1,4 +1,13 @@
-"""Embed chunks, retrieve context, generate answers, and score RAG quality."""
+"""Evaluate RAG quality by querying the live backend API.
+
+The evaluation pipeline now goes through the same retrieval + generation
+path that real users experience:
+
+  POST /api/queries/ask  →  returns answer + retrieved_chunks + top_similarity
+
+This means evaluation results reflect actual pgvector search quality and
+the production LLM prompt, not a separate in-memory simulation.
+"""
 
 from __future__ import annotations
 
@@ -8,69 +17,55 @@ from pathlib import Path
 
 import numpy as np
 import requests
-from openai import OpenAI
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
-from ingest import Chunk, build_chunks
 from utils import (
     answer_hit,
     hallucination_flag,
     read_json,
     retrieval_hit,
-    top_k_similar,
     write_csv,
     write_json,
 )
 
-
-def embed_texts(texts: list[str]) -> np.ndarray:
-    vectors: list[list[float]] = []
-    url = f"{config.EMBED_BASE_URL.rstrip('/')}/api/embeddings"
-    for text in texts:
-        resp = requests.post(
-            url,
-            json={"model": config.EMBED_MODEL, "prompt": text},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        vectors.append(resp.json()["embedding"])
-    return np.array(vectors, dtype=np.float32)
+# Default backend URL — override with --api-url
+DEFAULT_API_URL = "http://localhost:8000"
 
 
-def generate_answer(question: str, context: str) -> str:
-    client = OpenAI(base_url=config.GEN_BASE_URL, api_key=config.GEN_API_KEY)
-    prompt = (
-        "You are a helpful technical assistant. Answer using ONLY the provided context. "
-        "If the context does not contain enough information, say you do not know.\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-    )
-    response = client.chat.completions.create(
-        model=config.GEN_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-    )
-    return response.choices[0].message.content or ""
+def ask_backend(
+    api_url: str,
+    user_id: str,
+    question: str,
+    top_k: int,
+) -> dict:
+    """
+    Call POST /api/queries/ask and return the parsed JSON response.
+
+    Returns a dict with keys: question, answer, retrieved_chunks, top_similarity, query_id
+    """
+    url = f"{api_url.rstrip('/')}/api/queries/ask"
+    payload = {
+        "question": question,
+        "user_id": user_id,
+        "top_k": top_k,
+        "temperature": 0.1,
+    }
+    resp = requests.post(url, json=payload, timeout=300)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def run_evaluation(
-    docs_dir: Path,
     tests_file: Path,
     output_dir: Path,
     top_k: int,
-    chunk_size: int,
-    chunk_overlap: int,
+    api_url: str,
+    user_id: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     test_cases = read_json(tests_file)
-    chunks: list[Chunk] = build_chunks(docs_dir, chunk_size, chunk_overlap)
-
-    if not chunks:
-        raise RuntimeError(f"No chunks found in {docs_dir}")
-
-    chunk_texts = [c.text for c in chunks]
-    chunk_embeddings = embed_texts(chunk_texts)
 
     results: list[dict] = []
     retrieval_rows: list[dict] = []
@@ -78,23 +73,21 @@ def run_evaluation(
 
     for case in test_cases:
         question = case["question"]
-        q_vec = embed_texts([question])[0]
-        ranked = top_k_similar(q_vec, chunk_embeddings, top_k)
+        print(f"  evaluating: {case['id']} — {question[:60]}")
 
-        retrieved_chunks = [chunks[i] for i, _ in ranked]
-        retrieved_text = "\n\n".join(c.text for c in retrieved_chunks)
-        similarities = [score for _, score in ranked]
+        response = ask_backend(api_url, user_id, question, top_k)
 
-        generated = generate_answer(question, retrieved_text)
+        generated = response["answer"]
+        top_similarity = float(response.get("top_similarity", 0.0))
+        chunks = response.get("retrieved_chunks", [])
 
-        ctx_hit = retrieval_hit(
-            retrieved_text,
-            case.get("expected_context_contains", []),
-        )
-        ans_hit = answer_hit(
-            generated,
-            case.get("expected_answer_contains", []),
-        )
+        # Build retrieved_text from chunk snippets for phrase-match checks.
+        # The API returns truncated text (200 chars); good enough for hit checks.
+        retrieved_text = "\n\n".join(c.get("text", "") for c in chunks)
+        similarities = [float(c.get("similarity", 0.0)) for c in chunks]
+
+        ctx_hit = retrieval_hit(retrieved_text, case.get("expected_context_contains", []))
+        ans_hit = answer_hit(generated, case.get("expected_answer_contains", []))
         is_hallucination = hallucination_flag(
             generated,
             retrieved_text,
@@ -119,37 +112,34 @@ def run_evaluation(
                 "retrieval_hit": int(ctx_hit),
                 "answer_hit": int(ans_hit),
                 "hallucination": int(is_hallucination),
-                "top_similarity": round(max(similarities) if similarities else 0.0, 4),
+                "top_similarity": round(top_similarity, 4),
                 "avg_similarity": round(
-                    float(np.mean(similarities)) if similarities else 0.0,
-                    4,
+                    float(np.mean(similarities)) if similarities else 0.0, 4
                 ),
                 "generated_answer": generated,
             }
         )
 
-        for rank, (chunk, score) in enumerate(
-            zip(retrieved_chunks, similarities),
-            start=1,
-        ):
+        for rank, chunk in enumerate(chunks, start=1):
             retrieval_rows.append(
                 {
                     "id": case["id"],
                     "rank": rank,
-                    "chunk_id": chunk.chunk_id,
-                    "source_file": chunk.source_file,
-                    "similarity": round(float(score), 4),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "source_file": chunk.get("filename", "unknown"),
+                    "similarity": round(float(chunk.get("similarity", 0.0)), 4),
                 }
             )
 
     total = len(results)
     retrieval_rate = sum(r["retrieval_hit"] for r in results) / total if total else 0.0
     answer_rate = sum(r["answer_hit"] for r in results) / total if total else 0.0
-    hallucination_rate = sum(r["hallucination"] for r in results) / total if total else 0.0
+    hallucination_rate = (
+        sum(r["hallucination"] for r in results) / total if total else 0.0
+    )
 
     type_rows: list[dict] = []
-    types = sorted({r["question_type"] for r in results})
-    for qtype in types:
+    for qtype in sorted({r["question_type"] for r in results}):
         subset = [r for r in results if r["question_type"] == qtype]
         n = len(subset)
         type_rows.append(
@@ -157,16 +147,13 @@ def run_evaluation(
                 "question_type": qtype,
                 "count": n,
                 "retrieval_hit_rate": round(
-                    sum(r["retrieval_hit"] for r in subset) / n if n else 0.0,
-                    4,
+                    sum(r["retrieval_hit"] for r in subset) / n if n else 0.0, 4
                 ),
                 "answer_hit_rate": round(
-                    sum(r["answer_hit"] for r in subset) / n if n else 0.0,
-                    4,
+                    sum(r["answer_hit"] for r in subset) / n if n else 0.0, 4
                 ),
                 "hallucination_rate": round(
-                    sum(r["hallucination"] for r in subset) / n if n else 0.0,
-                    4,
+                    sum(r["hallucination"] for r in subset) / n if n else 0.0, 4
                 ),
             }
         )
@@ -177,10 +164,10 @@ def run_evaluation(
         "answer_hit_rate": round(answer_rate, 4),
         "hallucination_rate": round(hallucination_rate, 4),
         "top_k": top_k,
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
         "embed_model": config.EMBED_MODEL,
         "gen_model": config.GEN_MODEL,
+        "api_url": api_url,
+        "eval_user_id": user_id,
     }
 
     write_json(output_dir / "summary.json", summary)
@@ -189,37 +176,46 @@ def run_evaluation(
     write_csv(output_dir / "question_type_summary.csv", type_rows)
     write_json(output_dir / "hallucination_examples.json", hallucination_examples)
 
-    print(f"Evaluated {total} questions")
-    print(f"Retrieval hit rate: {retrieval_rate:.1%}")
-    print(f"Answer hit rate: {answer_rate:.1%}")
-    print(f"Hallucination rate: {hallucination_rate:.1%}")
-    print(f"Results saved to {output_dir}")
+    print(f"\nEvaluated {total} questions")
+    print(f"Retrieval hit rate : {retrieval_rate:.1%}")
+    print(f"Answer hit rate    : {answer_rate:.1%}")
+    print(f"Hallucination rate : {hallucination_rate:.1%}")
+    print(f"Results saved to   : {output_dir}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run local RAG evaluation")
-    parser.add_argument("--docs-dir", type=Path, default=APP_DOCS_DEFAULT)
-    parser.add_argument("--tests-file", type=Path, default=APP_TESTS_DEFAULT)
-    parser.add_argument("--output-dir", type=Path, default=APP_OUTPUT_DEFAULT)
+    APP_ROOT = Path(__file__).resolve().parent.parent
+    default_tests = APP_ROOT / "data" / "test_cases.json"
+    default_output = APP_ROOT / "runs" / "latest"
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate RAG quality via the live backend API"
+    )
+    parser.add_argument("--tests-file", type=Path, default=default_tests)
+    parser.add_argument("--output-dir", type=Path, default=default_output)
     parser.add_argument("--top-k", type=int, default=config.TOP_K)
-    parser.add_argument("--chunk-size", type=int, default=config.CHUNK_SIZE)
-    parser.add_argument("--chunk-overlap", type=int, default=config.CHUNK_OVERLAP)
+    parser.add_argument(
+        "--api-url",
+        default=DEFAULT_API_URL,
+        help="Base URL of the running backend (default: http://localhost:8000)",
+    )
+    parser.add_argument(
+        "--user-id",
+        default="eval-user",
+        help=(
+            "user_id whose uploaded documents are searched during evaluation. "
+            "Upload your test documents via the UI or API before running eval."
+        ),
+    )
     args = parser.parse_args()
 
     run_evaluation(
-        docs_dir=args.docs_dir,
         tests_file=args.tests_file,
         output_dir=args.output_dir,
         top_k=args.top_k,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
+        api_url=args.api_url,
+        user_id=args.user_id,
     )
-
-
-APP_ROOT = Path(__file__).resolve().parent.parent
-APP_DOCS_DEFAULT = APP_ROOT / "data" / "sample_docs"
-APP_TESTS_DEFAULT = APP_ROOT / "data" / "test_cases.json"
-APP_OUTPUT_DEFAULT = APP_ROOT / "runs" / "latest"
 
 
 if __name__ == "__main__":

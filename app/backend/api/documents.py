@@ -1,70 +1,78 @@
 """Document upload and management API endpoints."""
 
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import List
 import io
+import os
+import traceback
+
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
+from pypdf import PdfReader
+from sqlalchemy.orm import Session
+
 from db.connection import get_db
 from db.models import Document, DocumentChunk, User
+from services.chunking import chunk_text, clean_text
 from services.embeddings import embed_text
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 
-def chunk_text(text: str, chunk_size: int = 700, chunk_overlap: int = 120) -> List[str]:
-    """Split text into overlapping chunks."""
-    text = text.strip()
-    if not text:
-        return []
-    
-    if len(text) <= chunk_size:
-        return [text]
-    
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(end - chunk_overlap, start + 1)
-    
-    return [c for c in chunks if c]
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extract text from a PDF file."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts = []
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        if page_text:
+            parts.append(page_text)
+    return clean_text("\n\n".join(parts))
 
 
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    user_id: str = None,
+    user_id: str = Query(..., description="User ID"),
     db: Session = Depends(get_db)
 ):
-    """
-    Upload and process a document.
-    
-    - Reads file content
-    - Chunks the text
-    - Embeds each chunk
-    - Stores in PostgreSQL
-    """
     try:
-        # Ensure user exists
+        print("upload_document called")
+        print("user_id:", user_id)
+        print("filename:", file.filename)
+        print("content_type:", file.content_type)
+
         if not user_id:
             raise HTTPException(status_code=400, detail="user_id required")
-        
+
         user = db.query(User).filter(User.id == user_id).first()
+        print("user exists:", bool(user))
         if not user:
             user = User(id=user_id)
             db.add(user)
             db.flush()
-        
-        # Read file
+            print("created user")
+
         content = await file.read()
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            text = content.decode("latin-1")
-        
-        # Create document record
+        print("file bytes:", len(content))
+
+        filename_lower = (file.filename or "").lower()
+        if filename_lower.endswith(".pdf") or file.content_type == "application/pdf":
+            print("detected pdf, extracting text")
+            text = extract_text_from_pdf(content)
+            print("pdf text extracted")
+        else:
+            try:
+                text = content.decode("utf-8")
+                print("decoded utf-8")
+            except UnicodeDecodeError:
+                text = content.decode("latin-1", errors="ignore")
+                print("decoded latin-1 with ignore")
+
+            text = clean_text(text)
+
+        print("text length:", len(text))
+
+        if not text:
+            raise HTTPException(status_code=400, detail="No extractable text found in uploaded file")
+
         doc = Document(
             user_id=user_id,
             filename=file.filename,
@@ -72,11 +80,16 @@ async def upload_document(
         )
         db.add(doc)
         db.flush()
-        
-        # Chunk and embed
+        print("document id:", doc.id)
+
         chunks = chunk_text(text)
+        print("chunk count:", len(chunks))
+
         for idx, chunk_text_str in enumerate(chunks):
+            print("processing chunk:", idx, "len:", len(chunk_text_str))
             embedding = embed_text(chunk_text_str)
+            print("embedding type:", type(embedding), "len:", len(embedding))
+
             chunk = DocumentChunk(
                 document_id=doc.id,
                 text=chunk_text_str,
@@ -84,17 +97,20 @@ async def upload_document(
                 chunk_index=idx
             )
             db.add(chunk)
-        
+
         db.commit()
-        
+        db.refresh(doc)
+        print("commit successful")
+
         return {
             "document_id": doc.id,
             "filename": file.filename,
             "chunks_created": len(chunks),
             "message": "Document uploaded successfully"
         }
-    
+
     except Exception as e:
+        print(traceback.format_exc())
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -107,11 +123,11 @@ async def list_documents(
     """List all documents for a user."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
-    
+
     docs = db.query(Document).filter(
         Document.user_id == user_id
     ).all()
-    
+
     return [
         {
             "id": doc.id,
@@ -132,16 +148,16 @@ async def delete_document(
     """Delete a document and its chunks."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
-    
+
     doc = db.query(Document).filter(
         Document.id == document_id,
         Document.user_id == user_id
     ).first()
-    
+
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     db.delete(doc)
     db.commit()
-    
+
     return {"message": "Document deleted successfully"}

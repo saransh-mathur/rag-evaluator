@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+# Make app/shared importable when running from app/src/
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from shared.chunking import chunk_text  # noqa: F401 — re-exported for callers
 
 
 @dataclass
@@ -19,29 +25,6 @@ def read_markdown_files(docs_dir: Path) -> list[tuple[str, str]]:
     for path in sorted(docs_dir.glob("*.md")):
         docs.append((path.name, path.read_text(encoding="utf-8")))
     return docs
-
-
-def chunk_text(
-    text: str,
-    chunk_size: int,
-    chunk_overlap: int,
-) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(end - chunk_overlap, start + 1)
-    return [c for c in chunks if c]
 
 
 def build_chunks(

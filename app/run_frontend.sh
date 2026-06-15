@@ -6,4 +6,4 @@ set -a
 source .env
 set +a
 cd frontend
-streamlit run app.py --server.port=${STREAMLIT_PORT:-8501}
+PYTHONDONTWRITEBYTECODE=1 streamlit run app.py --server.port=${STREAMLIT_PORT:-8501}

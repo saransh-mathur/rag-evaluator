@@ -1,14 +1,18 @@
 """Query and chat API endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import List, Optional
 import json
+import traceback
+from typing import Iterator, List
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
 from db.connection import get_db
-from db.models import QueryHistory, User, DocumentChunk
+from db.models import DocumentChunk, QueryHistory, User
+from services.generation import generate_answer, generate_answer_stream
 from services.retrieval import search_similar_chunks
-from services.generation import generate_answer, generate_with_history
 
 router = APIRouter(prefix="/api/queries", tags=["queries"])
 
@@ -40,70 +44,91 @@ class HistoryResponse(BaseModel):
 
 
 @router.post("/ask", response_model=QueryResponse)
-async def ask_question(
-    req: QueryRequest,
-    db: Session = Depends(get_db)
-):
+async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
     """
     Process a user question and return answer with sources.
-    
-    1. Embed the question
+
+    1. Ensure user exists
     2. Search for similar chunks
     3. Generate answer using context
     4. Save to history
     """
     try:
-        # Ensure user exists
         user = db.query(User).filter(User.id == req.user_id).first()
         if not user:
             user = User(id=req.user_id)
             db.add(user)
             db.flush()
-        
-        # Search similar chunks
+
         search_results = search_similar_chunks(
             db,
             query=req.question,
             top_k=req.top_k,
             user_id=req.user_id
         )
-        
+
         if not search_results:
+            answer = generate_answer(
+                question=req.question,
+                context="",
+                temperature=req.temperature
+            )
+
+            history = QueryHistory(
+                user_id=req.user_id,
+                question=req.question,
+                answer=answer,
+                retrieved_chunks_ids=json.dumps([]),
+                top_similarity=0.0
+            )
+            db.add(history)
+            db.commit()
+            db.refresh(history)
+
             return QueryResponse(
                 question=req.question,
-                answer="No documents found. Please upload documents first.",
+                answer=answer,
                 retrieved_chunks=[],
                 top_similarity=0.0,
-                query_id=-1
+                query_id=history.id
             )
-        
-        # Prepare context
+
         retrieved_chunks = []
         context_parts = []
         top_similarity = 0.0
-        
-        for chunk, similarity in search_results:
+
+        for item in search_results:
+            if isinstance(item, tuple) and len(item) == 2:
+                chunk, similarity = item
+            else:
+                chunk, similarity = item, 0.0
+
+            filename = None
+            if getattr(chunk, "document", None) is not None:
+                filename = getattr(chunk.document, "filename", None)
+
             retrieved_chunks.append({
                 "chunk_id": chunk.id,
                 "document_id": chunk.document_id,
-                "filename": chunk.document.filename,
-                "text": chunk.text[:200] + "...",  # Preview
+                "filename": filename or "unknown",
+                "text": (chunk.text[:200] + "...") if chunk.text and len(chunk.text) > 200 else (chunk.text or ""),
                 "similarity": round(float(similarity), 4)
             })
-            context_parts.append(chunk.text)
-            if similarity > top_similarity:
-                top_similarity = similarity
-        
+
+            if chunk.text:
+                context_parts.append(chunk.text)
+
+            if similarity is not None and float(similarity) > top_similarity:
+                top_similarity = float(similarity)
+
         context = "\n\n---\n\n".join(context_parts)
-        
-        # Generate answer
+
         answer = generate_answer(
             question=req.question,
             context=context,
             temperature=req.temperature
         )
-        
-        # Save to history
+
         retrieved_ids = [c["chunk_id"] for c in retrieved_chunks]
         history = QueryHistory(
             user_id=req.user_id,
@@ -114,7 +139,8 @@ async def ask_question(
         )
         db.add(history)
         db.commit()
-        
+        db.refresh(history)
+
         return QueryResponse(
             question=req.question,
             answer=answer,
@@ -122,10 +148,129 @@ async def ask_question(
             top_similarity=top_similarity,
             query_id=history.id
         )
-    
+
     except Exception as e:
+        print(traceback.format_exc())
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Streaming endpoint
+# ---------------------------------------------------------------------------
+
+def _sse(payload: dict) -> str:
+    """Format a dict as a Server-Sent Events data line."""
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+@router.post("/ask-stream")
+async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
+    """
+    Streaming version of /ask.
+
+    SSE event sequence:
+      1. {"type": "sources", "retrieved_chunks": [...], "top_similarity": float}
+      2. {"type": "token",   "content": "<token>"}   — one per LLM token
+      3. {"type": "done",    "query_id": int}
+    """
+
+    def event_stream() -> Iterator[str]:
+        try:
+            # Ensure user exists
+            user = db.query(User).filter(User.id == req.user_id).first()
+            if not user:
+                db.add(User(id=req.user_id))
+                db.flush()
+
+            # --- Retrieval -------------------------------------------------
+            search_results = search_similar_chunks(
+                db,
+                query=req.question,
+                top_k=req.top_k,
+                user_id=req.user_id,
+            )
+
+            retrieved_chunks: list[dict] = []
+            context_parts: list[str] = []
+            top_similarity = 0.0
+
+            for item in search_results:
+                chunk, similarity = item if isinstance(item, tuple) else (item, 0.0)
+                filename = (
+                    getattr(chunk.document, "filename", None)
+                    if getattr(chunk, "document", None)
+                    else None
+                )
+                retrieved_chunks.append(
+                    {
+                        "chunk_id": chunk.id,
+                        "document_id": chunk.document_id,
+                        "filename": filename or "unknown",
+                        "text": (
+                            (chunk.text[:200] + "...")
+                            if chunk.text and len(chunk.text) > 200
+                            else (chunk.text or "")
+                        ),
+                        "similarity": round(float(similarity), 4),
+                    }
+                )
+                if chunk.text:
+                    context_parts.append(chunk.text)
+                if similarity is not None and float(similarity) > top_similarity:
+                    top_similarity = float(similarity)
+
+            # Fire sources event immediately so the UI can show them
+            yield _sse(
+                {
+                    "type": "sources",
+                    "retrieved_chunks": retrieved_chunks,
+                    "top_similarity": top_similarity,
+                }
+            )
+
+            context = "\n\n---\n\n".join(context_parts)
+
+            # --- Streaming generation --------------------------------------
+            full_answer_parts: list[str] = []
+            for token in generate_answer_stream(
+                question=req.question,
+                context=context,
+                temperature=req.temperature,
+            ):
+                full_answer_parts.append(token)
+                yield _sse({"type": "token", "content": token})
+
+            full_answer = "".join(full_answer_parts)
+
+            # --- Persist history -------------------------------------------
+            retrieved_ids = [c["chunk_id"] for c in retrieved_chunks]
+            history = QueryHistory(
+                user_id=req.user_id,
+                question=req.question,
+                answer=full_answer,
+                retrieved_chunks_ids=json.dumps(retrieved_ids),
+                top_similarity=top_similarity,
+            )
+            db.add(history)
+            db.commit()
+            db.refresh(history)
+
+            yield _sse({"type": "done", "query_id": history.id})
+
+        except Exception:
+            print(traceback.format_exc())
+            db.rollback()
+            yield _sse({"type": "error", "detail": "Streaming generation failed"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering if proxied
+        },
+    )
 
 
 @router.get("/history")
@@ -137,13 +282,13 @@ async def get_query_history(
     """Get query history for a user."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
-    
+
     queries = db.query(QueryHistory).filter(
         QueryHistory.user_id == user_id
     ).order_by(
         QueryHistory.created_at.desc()
     ).limit(limit).all()
-    
+
     return [
         HistoryResponse(
             id=q.id,
@@ -165,15 +310,19 @@ async def get_query_detail(
     query = db.query(QueryHistory).filter(
         QueryHistory.id == query_id
     ).first()
-    
+
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
-    
+
     chunk_ids = json.loads(query.retrieved_chunks_ids or "[]")
-    chunks = db.query(DocumentChunk).filter(
-        DocumentChunk.id.in_(chunk_ids)
-    ).all() if chunk_ids else []
-    
+
+    chunks = (
+        db.query(DocumentChunk).filter(
+            DocumentChunk.id.in_(chunk_ids)
+        ).all()
+        if chunk_ids else []
+    )
+
     return {
         "id": query.id,
         "question": query.question,
@@ -182,7 +331,7 @@ async def get_query_detail(
         "retrieved_chunks": [
             {
                 "chunk_id": c.id,
-                "filename": c.document.filename,
+                "filename": c.document.filename if getattr(c, "document", None) else "unknown",
                 "text": c.text,
                 "chunk_index": c.chunk_index
             }
@@ -200,16 +349,16 @@ async def delete_query(
     """Delete a query from history."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
-    
+
     query = db.query(QueryHistory).filter(
         QueryHistory.id == query_id,
         QueryHistory.user_id == user_id
     ).first()
-    
+
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
-    
+
     db.delete(query)
     db.commit()
-    
+
     return {"message": "Query deleted successfully"}
