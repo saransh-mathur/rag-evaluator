@@ -1,15 +1,15 @@
 # RAG AI Chat — Interactive Document Q&A System
 
-An interactive **RAG (Retrieval-Augmented Generation)** system with document uploads, vector search, streaming responses, and a built-in evaluation pipeline. Ask questions about your documents using local AI models — no cloud APIs required.
+An interactive **RAG (Retrieval-Augmented Generation)** system with document uploads, vector search, streaming responses, and a built-in evaluation pipeline. Ask questions about your documents using local AI models (Ollama) or cloud APIs like Google Gemini.
 
 **Key Features:**
 - 📤 Upload documents — PDF, plain text, and markdown
 - 🔍 Vector search with PostgreSQL pgvector
-- 🤖 Streaming answers via local LLMs (Ollama)
+- 🤖 Streaming answers via local LLMs (Ollama) or Google Gemini
 - 💬 Interactive chat interface (Streamlit)
 - 📚 Sources shown with similarity scores as the answer streams
 - � Built-in RAG evaluation pipeline with a results dashboard
-- �🔐 100% local — no cloud APIs, full data privacy
+- 🔐 Flexible privacy — run 100% locally or connect to cloud APIs
 
 ---
 
@@ -31,7 +31,7 @@ An interactive **RAG (Retrieval-Augmented Generation)** system with document upl
 
 3. ANSWER IS STREAMED
    └─ Retrieved chunks become the LLM context
-   └─ deepseek-r1:7b streams tokens back token-by-token
+   └─ gemma4:12b streams tokens back token-by-token
    └─ Full answer + query saved to history
 ```
 
@@ -57,8 +57,8 @@ An interactive **RAG (Retrieval-Augmented Generation)** system with document upl
         ┌────────────┼────────────┐
         │            │            │
    ┌────▼─────┐ ┌───▼────┐ ┌────▼──────────┐
-   │PostgreSQL │ │ Ollama │ │  nomic-embed  │
-   │+ pgvector │ │  LLM   │ │  (embeddings) │
+   │PostgreSQL │ │ LLM    │ │  nomic-embed  │
+   │+ pgvector │ │        │ │  (embeddings) │
    └───────────┘ └────────┘ └───────────────┘
 ```
 

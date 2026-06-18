@@ -475,7 +475,7 @@ def upload_modal():
             border-radius:10px;padding:14px 18px;margin-bottom:16px;
             font-size:.88rem;color:var(--text-dim);line-height:1.8">
         <b style="color:var(--accent2)">Supported formats</b><br>
-        📄 <b>PDF</b> — text-based PDFs &nbsp; 📝 <b>TXT</b> — plain text &nbsp; 📋 <b>MD</b> — Markdown<br><br>
+        📄 <b>PDF</b> — text/scanned PDFs &nbsp; 📝 <b>TXT/MD</b> — plain text &nbsp; 🖼️ <b>Image</b> — PNG, JPG (OCR)<br><br>
         <b style="color:var(--accent2)">How it works</b><br>
         Text is extracted → split into overlapping chunks → embedded into 768-dim vectors
         → stored in PostgreSQL pgvector. Retrieval uses hybrid BM25 + vector search with
@@ -487,7 +487,7 @@ def upload_modal():
     col_file, col_col = st.columns([3, 2])
     with col_file:
         uploaded_file = st.file_uploader(
-            "Choose a file", type=["pdf", "txt", "md"], key="modal_uploader"
+            "Choose a file", type=["pdf", "txt", "md", "png", "jpg", "jpeg"], key="modal_uploader"
         )
     with col_col:
         collections = load_collections()
@@ -499,8 +499,13 @@ def upload_modal():
 
     if uploaded_file:
         size_kb = len(uploaded_file.getvalue()) / 1024
+        is_image = uploaded_file.name.lower().endswith((".png", ".jpg", ".jpeg"))
+        
         try:
-            preview = uploaded_file.getvalue()[:1000].decode("utf-8", errors="ignore")[:400].strip()
+            if not is_image:
+                preview = uploaded_file.getvalue()[:1000].decode("utf-8", errors="ignore")[:400].strip()
+            else:
+                preview = ""
         except Exception:
             preview = ""
 
@@ -509,7 +514,11 @@ def upload_modal():
             f"<span style='color:var(--text-mute)'>{size_kb:.0f} KB</span>",
             unsafe_allow_html=True,
         )
-        if preview:
+        
+        if is_image:
+            with st.expander("👁 Preview", expanded=False):
+                st.image(uploaded_file, use_container_width=True)
+        elif preview:
             with st.expander("👁 Preview (first 400 chars)", expanded=False):
                 st.markdown(
                     f"<pre style='font-size:.8rem;color:var(--text-dim);white-space:pre-wrap'>{preview}…</pre>",

@@ -50,9 +50,9 @@ def main():
         # Copy or create .env
         env_content = """# Ollama Configuration
 EMBED_BASE_URL=http://localhost:11434
-EMBED_MODEL=nomic-embed-text
+EMBED_MODEL=nomic-embed-text-v2-moe
 GEN_BASE_URL=http://localhost:11434/v1
-GEN_MODEL=deepseek-r1:7b
+GEN_MODEL=gemma4:12b
 GEN_API_KEY=ollama
 
 # PostgreSQL Configuration
@@ -89,8 +89,8 @@ CHUNK_OVERLAP=120
    - Download from https://ollama.com
    - Run: ollama serve
    - Pull models:
-     ollama pull nomic-embed-text
-     ollama pull deepseek-r1:7b
+     ollama pull nomic-embed-text-v2-moe
+     ollama pull gemma4:12b
 
 3️⃣  Update .env:
    Edit .env with your PostgreSQL password

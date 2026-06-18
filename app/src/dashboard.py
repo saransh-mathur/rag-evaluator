@@ -39,11 +39,14 @@ def load_run_dir(run_dir: Path) -> None:
     st.title("RAG Evaluation Dashboard")
     st.caption(f"Run directory: `{run_dir}`")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Questions", summary["total_questions"])
     c2.metric("Retrieval Hit Rate", f"{summary['retrieval_hit_rate']:.1%}")
     c3.metric("Answer Hit Rate", f"{summary['answer_hit_rate']:.1%}")
     c4.metric("Hallucination Rate", f"{summary['hallucination_rate']:.1%}")
+    c5.metric("Avg Latency", f"{summary.get('avg_latency_seconds', 0.0):.2f}s")
+
+    st.caption(f"**Avg tokens per query:** {summary.get('avg_total_tokens', 0):.0f} (Prompt: {summary.get('avg_prompt_tokens', 0):.0f} | Completion: {summary.get('avg_completion_tokens', 0):.0f})")
 
     with st.expander("Run configuration"):
         st.json(summary)

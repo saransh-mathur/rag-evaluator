@@ -18,6 +18,9 @@ pypdf==4.2.0
 
 # Retrieval improvements
 rank-bm25==0.2.2
+# Optional cross-encoder reranking (set RERANK_PROVIDER=cross_encoder;
+# set RERANK_ALLOW_DOWNLOAD=true only if model downloads are acceptable):
+# sentence-transformers>=3.0.0
 
 # Rate limiting
 slowapi==0.1.9

@@ -20,7 +20,11 @@ from services.generation import (
     generate_suggestions,
     generate_search_autocomplete,
 )
-from services.retrieval import search_similar_chunks
+from services.retrieval_strategies import (
+    DEFAULT_RETRIEVAL_STRATEGY,
+    get_retrieval_strategy,
+    list_retrieval_strategies,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/queries", tags=["queries"])
@@ -55,6 +59,7 @@ class QueryRequest(BaseModel):
     question:     str
     user_id:      str
     top_k:        int   = 8
+    strategy:     str   = DEFAULT_RETRIEVAL_STRATEGY
     temperature:  float = 0.1
     max_tokens:   int   = 2048
     doc_mode:     bool  = True    # True = use retrieved context; False = general chat
@@ -70,6 +75,7 @@ class QueryResponse(BaseModel):
     top_similarity:   float
     query_id:         int
     doc_mode:         bool
+    strategy:         str
 
 
 class HistoryResponse(BaseModel):
@@ -114,15 +120,26 @@ def _build_context_and_chunks(
       - retrieved_chunks list for the response
       - top_similarity float
     """
-    search_results = search_similar_chunks(
-        db,
+    strategy_name = (req.strategy or DEFAULT_RETRIEVAL_STRATEGY).lower()
+    try:
+        strategy = get_retrieval_strategy(strategy_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if strategy_name == DEFAULT_RETRIEVAL_STRATEGY:
+        # Preserve the legacy toggles for existing callers during Phase 1.
+        strategy.use_hyde = req.use_hyde if hasattr(strategy, "use_hyde") else False
+        strategy.use_rerank = req.use_rerank if hasattr(strategy, "use_rerank") else True
+
+    retrieval_result = strategy.retrieve(
+        db=db,
         query=req.question,
         top_k=req.top_k,
         user_id=req.user_id,
-        use_hyde=req.use_hyde,
-        use_rerank=req.use_rerank,
+        chat_history=req.chat_history,
         doc_mode=req.doc_mode,
     )
+    search_results = retrieval_result.chunks
 
     retrieved_chunks: list[dict] = []
     context_parts:    list[str]  = []
@@ -203,6 +220,7 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
             top_similarity=top_similarity,
             query_id=history.id,
             doc_mode=req.doc_mode,
+            strategy=(req.strategy or DEFAULT_RETRIEVAL_STRATEGY).lower(),
         )
 
     except HTTPException:
@@ -295,6 +313,14 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
+
+@router.get("/strategies")
+async def get_strategies():
+    return {
+        "default": DEFAULT_RETRIEVAL_STRATEGY,
+        "strategies": list_retrieval_strategies(),
+    }
+
 
 @router.get("/history")
 async def get_query_history(

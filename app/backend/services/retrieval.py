@@ -13,17 +13,21 @@ Search pipeline:
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Tuple
 
 from sqlalchemy.orm import Session
 from sqlalchemy import cast as sa_cast, Float, text
 
 from services.embeddings import embed_text
+from services.faiss_store import faiss_store
 from services.reranker import rerank
 from db.models import Document, DocumentChunk
 
 logger = logging.getLogger(__name__)
 
+
+VECTOR_STORE = os.getenv("VECTOR_STORE", "faiss").lower()
 
 # ---------------------------------------------------------------------------
 # BM25 helpers
@@ -115,35 +119,33 @@ def search_similar_chunks(
     fetch_k = top_k * 2
     query_embedding = [float(x) for x in embed_text(embed_query)]
 
-    distance_expr = sa_cast(
-        DocumentChunk.embedding.op("<=>")(query_embedding),
-        Float,
-    )
-
-    base_q = db.query(DocumentChunk, distance_expr.label("distance"))
-
-    if user_id:
-        base_q = (
-            base_q
-            .join(Document, DocumentChunk.document_id == Document.id)
-            .filter(Document.user_id == user_id)
+    if VECTOR_STORE == "faiss":
+        vector_ranked = faiss_store.search_chunks(db, query_embedding, fetch_k, user_id)
+    else:
+        distance_expr = sa_cast(
+            DocumentChunk.embedding.op("<=>")(query_embedding),
+            Float,
         )
-
-    vector_rows = (
-        base_q
-        .order_by(distance_expr)
-        .limit(fetch_k)
-        .all()
-    )
-
-    if not vector_rows:
+        base_q = db.query(DocumentChunk, distance_expr.label("distance"))
+        if user_id:
+            base_q = (
+                base_q
+                .join(Document, DocumentChunk.document_id == Document.id)
+                .filter(Document.user_id == user_id)
+            )
+        vector_rows = (
+            base_q
+            .order_by(distance_expr)
+            .limit(fetch_k)
+            .all()
+        )
+        vector_ranked = [
+            (chunk, round(1.0 - float(dist), 4))
+            for chunk, dist in vector_rows
+        ]
+        
+    if not vector_ranked:
         return []
-
-    # Convert distance → similarity (cosine distance: sim = 1 - dist)
-    vector_ranked: list[tuple[DocumentChunk, float]] = [
-        (chunk, round(1.0 - float(dist), 4))
-        for chunk, dist in vector_rows
-    ]
 
     chunks_pool = [c for c, _ in vector_ranked]
 

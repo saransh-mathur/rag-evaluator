@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,7 @@ def ask_backend(
     user_id: str,
     question: str,
     top_k: int,
+    strategy: str,
 ) -> dict:
     """
     Call POST /api/queries/ask and return the parsed JSON response.
@@ -50,11 +52,16 @@ def ask_backend(
         "question": question,
         "user_id": user_id,
         "top_k": top_k,
+        "strategy": strategy,
         "temperature": 0.1,
     }
+    start_time = time.time()
     resp = requests.post(url, json=payload, timeout=300)
+    latency = time.time() - start_time
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    data["latency"] = latency
+    return data
 
 
 def run_evaluation(
@@ -63,6 +70,7 @@ def run_evaluation(
     top_k: int,
     api_url: str,
     user_id: str,
+    strategy: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     test_cases = read_json(tests_file)
@@ -75,9 +83,14 @@ def run_evaluation(
         question = case["question"]
         print(f"  evaluating: {case['id']} — {question[:60]}")
 
-        response = ask_backend(api_url, user_id, question, top_k)
+        response = ask_backend(api_url, user_id, question, top_k, strategy)
 
         generated = response["answer"]
+        latency = response.get("latency", 0.0)
+        usage = response.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
         top_similarity = float(response.get("top_similarity", 0.0))
         chunks = response.get("retrieved_chunks", [])
 
@@ -113,6 +126,11 @@ def run_evaluation(
                 "answer_hit": int(ans_hit),
                 "hallucination": int(is_hallucination),
                 "top_similarity": round(top_similarity, 4),
+                "strategy": strategy,
+                "latency_seconds": round(latency, 4),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
                 "avg_similarity": round(
                     float(np.mean(similarities)) if similarities else 0.0, 4
                 ),
@@ -137,6 +155,10 @@ def run_evaluation(
     hallucination_rate = (
         sum(r["hallucination"] for r in results) / total if total else 0.0
     )
+    avg_latency = sum(r.get("latency_seconds", 0.0) for r in results) / total if total else 0.0
+    avg_prompt_tokens = sum(r["prompt_tokens"] for r in results) / total if total else 0.0
+    avg_completion_tokens = sum(r["completion_tokens"] for r in results) / total if total else 0.0
+    avg_total_tokens = sum(r["total_tokens"] for r in results) / total if total else 0.0
 
     type_rows: list[dict] = []
     for qtype in sorted({r["question_type"] for r in results}):
@@ -163,7 +185,12 @@ def run_evaluation(
         "retrieval_hit_rate": round(retrieval_rate, 4),
         "answer_hit_rate": round(answer_rate, 4),
         "hallucination_rate": round(hallucination_rate, 4),
+        "avg_latency_seconds": round(avg_latency, 4),
+        "avg_prompt_tokens": round(avg_prompt_tokens, 1),
+        "avg_completion_tokens": round(avg_completion_tokens, 1),
+        "avg_total_tokens": round(avg_total_tokens, 1),
         "top_k": top_k,
+        "strategy": strategy,
         "embed_model": config.EMBED_MODEL,
         "gen_model": config.GEN_MODEL,
         "api_url": api_url,
@@ -207,6 +234,12 @@ def main() -> None:
             "Upload your test documents via the UI or API before running eval."
         ),
     )
+    parser.add_argument(
+        "--strategy",
+        default="hybrid",
+        choices=["basic", "hybrid", "advanced"],
+        help="Retrieval strategy to evaluate",
+    )
     args = parser.parse_args()
 
     run_evaluation(
@@ -215,6 +248,7 @@ def main() -> None:
         top_k=args.top_k,
         api_url=args.api_url,
         user_id=args.user_id,
+        strategy=args.strategy,
     )
 
 

@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from db.connection import init_db, engine
 from api import documents, queries
+from services.faiss_store import faiss_store
 
 # ---------------------------------------------------------------------------
 # Structured logging
@@ -35,6 +36,15 @@ async def lifespan(app: FastAPI):
         logger.info("Database initialised successfully")
     except Exception as e:
         logger.error(f"Database initialisation failed: {e}")
+        
+    logger.info("Initializing FAISS index…")
+    try:
+        from db.connection import SessionLocal
+        with SessionLocal() as db:
+            faiss_store.load_from_db(db)
+    except Exception as e:
+        logger.error(f"FAISS init failed: {e}")
+        
     yield
     logger.info("Shutting down…")
 
@@ -95,6 +105,18 @@ async def health():
 
     overall = "healthy" if all(v == "ok" for v in results.values()) else "degraded"
     return {"status": overall, "dependencies": results}
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Mock OpenAI-compatible models endpoint to silence 404 logs from scanners/clients."""
+    return {
+        "object": "list",
+        "data": [
+            {"id": os.getenv("GEN_MODEL", "gemma4:12b"), "object": "model", "owned_by": "ollama"},
+            {"id": os.getenv("EMBED_MODEL", "nomic-embed-text-v2-moe"), "object": "model", "owned_by": "ollama"}
+        ]
+    }
 
 
 if __name__ == "__main__":

@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEN_BASE_URL = os.getenv("GEN_BASE_URL", "http://localhost:11434/v1")
-GEN_MODEL    = os.getenv("GEN_MODEL",     "deepseek-r1:7b")
-GEN_API_KEY  = os.getenv("GEN_API_KEY",   "ollama")
+GEN_MODEL    = os.getenv("GEN_MODEL",     "gemma4:12b")
+GEN_API_KEY  = os.getenv("GEN_API_KEY", os.getenv("GEMINI_API_KEY", "ollama"))
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -101,7 +101,7 @@ def generate_answer(
     max_tokens: int = 2048,
     chat_history: list[dict] | None = None,
     doc_mode: bool = True,
-) -> str:
+) -> tuple[str, dict]:
     """
     Generate a complete answer (non-streaming).
 
@@ -114,7 +114,7 @@ def generate_answer(
         doc_mode:     If True, constrain answer to context
 
     Returns:
-        Clean answer string (think-tags stripped)
+        Tuple of (Clean answer string, usage dictionary)
     """
     try:
         effective_tokens = _dynamic_max_tokens(question, max_tokens)
@@ -124,10 +124,17 @@ def generate_answer(
             messages=messages,
             temperature=temperature,
             max_tokens=effective_tokens,
-            timeout=180,
+            timeout=300,
         )
         raw = response.choices[0].message.content or ""
-        return _strip_think_tags(raw)
+        
+        usage = response.usage
+        usage_dict = {
+            "prompt_tokens": usage.prompt_tokens if usage else 0,
+            "completion_tokens": usage.completion_tokens if usage else 0,
+            "total_tokens": usage.total_tokens if usage else 0,
+        }
+        return _strip_think_tags(raw), usage_dict
     except Exception as e:
         raise RuntimeError(f"Generation failed: {e}")
 
@@ -154,7 +161,7 @@ def generate_answer_stream(
             temperature=temperature,
             max_tokens=effective_tokens,
             stream=True,
-            timeout=180,
+            timeout=300,
         )
 
         # Buffer to handle think-tag stripping across chunk boundaries
@@ -212,11 +219,51 @@ def generate_hypothetical_document(question: str) -> str:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=256,
-            timeout=60,
+            timeout=300,
         )
         return _strip_think_tags(response.choices[0].message.content or "")
     except Exception:
         return question  # fall back to original query
+
+
+def generate_query_expansions(question: str, n: int = 4) -> list[str]:
+    """
+    Generate semantically related search queries for multi-query retrieval.
+
+    Returns an empty list on failure so retrieval can fall back to the original
+    query without impacting the user-facing answer path.
+    """
+    try:
+        prompt = (
+            f"Generate exactly {n} concise search queries that are semantically "
+            "similar to the user's question. Keep each query short. "
+            "Return ONLY the queries, one per line, with no numbering or extra text.\n\n"
+            f"Question: {question}\n\nSearch queries:"
+        )
+        response = _client().chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=200,
+            timeout=300,
+        )
+        raw = _strip_think_tags(response.choices[0].message.content or "")
+        expansions: list[str] = []
+        seen: set[str] = set()
+        for line in raw.splitlines():
+            cleaned = line.strip().lstrip("-•·123456789.) ").strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key == question.lower() or key in seen:
+                continue
+            seen.add(key)
+            expansions.append(cleaned)
+            if len(expansions) >= n:
+                break
+        return expansions
+    except Exception:
+        return []
 
 
 def generate_document_summary(text: str, filename: str) -> str:
@@ -235,7 +282,7 @@ def generate_document_summary(text: str, filename: str) -> str:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=150,
-            timeout=60,
+            timeout=300,
         )
         return _strip_think_tags(response.choices[0].message.content or "")
     except Exception:
@@ -262,7 +309,7 @@ def generate_suggestions(
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=200,
-            timeout=60,
+            timeout=300,
         )
         raw = _strip_think_tags(response.choices[0].message.content or "")
         return [

@@ -1,14 +1,14 @@
 # RAG AI Chat - Interactive Document Q&A System
 
-An interactive **RAG (Retrieval-Augmented Generation)** system with user document uploads, vector search, and local LLM responses. Ask questions about your documents using local AI models—no cloud APIs required!
+An interactive **RAG (Retrieval-Augmented Generation)** system with user document uploads, vector search, and LLM responses. Ask questions about your documents using local AI models or cloud APIs like Google Gemini!
 
 **Key Features:**
 - 📤 Upload documents (markdown, text files)
 - 🔍 Vector search with PostgreSQL pgvector
-- 🤖 Generate answers using local LLMs (Ollama)
+- 🤖 Generate answers using local LLMs (Ollama) or Google Gemini
 - 💬 Interactive chat interface (Streamlit)
 - 📚 See retrieved sources with similarity scores
-- 🔐 100% local—no cloud APIs, full privacy
+- 🔐 Flexible privacy — run 100% locally or connect to cloud APIs
 
 ## How It Works
 
@@ -33,7 +33,7 @@ An interactive **RAG (Retrieval-Augmented Generation)** system with user documen
    
 4. LLM GENERATES ANSWER
    ↓
-   [deepseek-r1:7b reads context + question]
+   [gemma4:12b reads context + question]
    [Generates answer using only that context]
    [Answer prevents hallucinations]
    
@@ -77,7 +77,7 @@ An interactive **RAG (Retrieval-Augmented Generation)** system with user documen
 |-----------|---------|
 | **nomic-embed-text** | Converts text → 768-dimensional vectors |
 | **PostgreSQL pgvector** | Stores and searches vectors efficiently |
-| **deepseek-r1:7b** | Generates answers based on context |
+| **gemma4:12b / Gemini** | Generates answers based on context |
 | **FastAPI** | Backend API handling documents & queries |
 | **Streamlit** | Web UI for chat and uploads |
 
@@ -143,8 +143,8 @@ ollama serve
 # Download embedding model (~200MB)
 ollama pull nomic-embed-text
 
-# Download LLM (~4.7GB - takes time)
-ollama pull deepseek-r1:7b
+# Download LLM (~8GB - takes time)
+ollama pull gemma4:12b
 
 # Verify models are downloaded
 ollama list
@@ -327,9 +327,16 @@ The `.env` file controls all settings:
 # ========== Ollama (Local AI) ==========
 EMBED_BASE_URL=http://localhost:11434      # Ollama server address
 EMBED_MODEL=nomic-embed-text               # Embedding model
+
+# Generation (Local LLM)
 GEN_BASE_URL=http://localhost:11434/v1     # LLM server address
-GEN_MODEL=deepseek-r1:7b                   # LLM model
+GEN_MODEL=gemma4:12b                       # LLM model
 GEN_API_KEY=ollama                         # LLM API key
+
+# Generation (Cloud Gemini API)
+# GEN_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+# GEN_MODEL=gemini-3.5-flash
+# GEN_API_KEY=your_gemini_api_key
 
 # ========== PostgreSQL Database ==========
 DATABASE_URL=postgresql://postgres:password@localhost:5432/rag_ai
@@ -496,4 +503,3 @@ MIT
 - [FastAPI](https://fastapi.tiangolo.com)
 - [Streamlit](https://streamlit.io)
 - [Nomic Embeddings](https://www.nomic.ai/)
-

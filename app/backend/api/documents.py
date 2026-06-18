@@ -15,6 +15,7 @@ from db.connection import get_db
 from db.models import Document, DocumentChunk, User
 from services.chunking import chunk_text, clean_text
 from services.embeddings import embed_text
+from services.faiss_store import faiss_store
 from services.retrieval import search_document_text
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,38 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     parts = [page.extract_text() or "" for page in reader.pages]
-    return clean_text("\n\n".join(p for p in parts if p))
+    text = clean_text("\n\n".join(p for p in parts if p))
+
+    # If very little text is found, it might be a scanned PDF. Fallback to OCR.
+    if len(text.strip()) < 50:
+        try:
+            import pytesseract
+            from pdf2image import convert_from_bytes
+        except ImportError:
+            logger.warning("Scanned PDF detected, but OCR dependencies missing. Install: pip install pytesseract pdf2image")
+            return text
+            
+        try:
+            logger.info("Running OCR on scanned PDF...")
+            images = convert_from_bytes(pdf_bytes)
+            ocr_parts = [pytesseract.image_to_string(img) for img in images]
+            text = clean_text("\n\n".join(p for p in ocr_parts if p))
+        except Exception as e:
+            logger.warning(f"OCR failed for PDF (is poppler-utils installed?): {e}")
+            
+    return text
+
+
+def extract_text_from_image(img_bytes: bytes) -> str:
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("OCR dependencies missing. Run: pip install pytesseract Pillow")
+        
+    img = Image.open(io.BytesIO(img_bytes))
+    text = pytesseract.image_to_string(img)
+    return clean_text(text)
 
 
 def _generate_summary_bg(document_id: int, text: str, filename: str) -> None:
@@ -84,6 +116,8 @@ async def upload_document(
 
         if filename_lower.endswith(".pdf") or file.content_type == "application/pdf":
             text = extract_text_from_pdf(content)
+        elif filename_lower.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp")) or (file.content_type and file.content_type.startswith("image/")):
+            text = extract_text_from_image(content)
         else:
             try:
                 text = content.decode("utf-8")
@@ -106,17 +140,27 @@ async def upload_document(
         chunks = chunk_text(text)
         logger.info(f"Uploading {file.filename}: {len(chunks)} chunks")
 
+        db_chunks = []
         for idx, chunk_str in enumerate(chunks):
             embedding = embed_text(chunk_str)
-            db.add(DocumentChunk(
+            db_chunk = DocumentChunk(
                 document_id=doc.id,
                 text=chunk_str,
                 embedding=embedding,
                 chunk_index=idx,
-            ))
+            )
+            db.add(db_chunk)
+            db_chunks.append(db_chunk)
 
         db.commit()
         db.refresh(doc)
+
+        # Sync to FAISS
+        faiss_store.add(
+            chunk_ids=[c.id for c in db_chunks],
+            embeddings=[c.embedding for c in db_chunks],
+            user_ids_map={c.id: user_id for c in db_chunks}
+        )
 
         # Generate summary asynchronously — doesn't block the upload response
         background_tasks.add_task(
@@ -228,6 +272,10 @@ async def delete_document(
     ).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+        
+    chunk_ids = [c.id for c in db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).all()]
+    faiss_store.remove_document_chunks(chunk_ids)
+    
     db.delete(doc)
     db.commit()
     return {"message": "Document deleted successfully"}

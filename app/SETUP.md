@@ -17,7 +17,7 @@ Backend API (FastAPI)
 ┌─────────────────────────────────┐
 │  Ollama (Local)                 │
 │  - nomic-embed-text (embeddings)│
-│  - deepseek-r1:7b (LLM)         │
+│  - gemma4:12b (LLM)             │
 └─────────────────────────────────┘
 ```
 
