@@ -33,31 +33,58 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
     # If very little text is found, it might be a scanned PDF. Fallback to OCR.
     if len(text.strip()) < 50:
+        import shutil
+        has_tesseract = shutil.which("tesseract") is not None
+        has_poppler = shutil.which("pdftoppm") is not None
+
         try:
             import pytesseract
             from pdf2image import convert_from_bytes
         except ImportError:
-            logger.warning("Scanned PDF detected, but OCR dependencies missing. Install: pip install pytesseract pdf2image")
-            return text
-            
+            raise RuntimeError(
+                "Scanned PDF detected, but OCR Python dependencies are missing. "
+                "Please run: pip install pytesseract pdf2image"
+            )
+
+        if not has_tesseract:
+            raise RuntimeError(
+                "Scanned PDF detected, but Tesseract OCR engine is not installed on the system. "
+                "Please run: sudo apt install tesseract-ocr"
+            )
+        if not has_poppler:
+            raise RuntimeError(
+                "Scanned PDF detected, but Poppler utilities (pdftoppm) are not installed on the system. "
+                "Please run: sudo apt install poppler-utils"
+            )
+
         try:
             logger.info("Running OCR on scanned PDF...")
             images = convert_from_bytes(pdf_bytes)
             ocr_parts = [pytesseract.image_to_string(img) for img in images]
             text = clean_text("\n\n".join(p for p in ocr_parts if p))
         except Exception as e:
-            logger.warning(f"OCR failed for PDF (is poppler-utils installed?): {e}")
+            logger.warning(f"OCR failed for PDF: {e}")
+            raise RuntimeError(f"OCR processing failed: {e}")
             
     return text
 
 
 def extract_text_from_image(img_bytes: bytes) -> str:
+    import shutil
+    has_tesseract = shutil.which("tesseract") is not None
+
     try:
         import pytesseract
         from PIL import Image
     except ImportError:
-        raise RuntimeError("OCR dependencies missing. Run: pip install pytesseract Pillow")
-        
+        raise RuntimeError("OCR Python dependencies are missing. Run: pip install pytesseract Pillow")
+
+    if not has_tesseract:
+        raise RuntimeError(
+            "Image uploaded, but Tesseract OCR engine is not installed on the system. "
+            "Please run: sudo apt install tesseract-ocr"
+        )
+
     img = Image.open(io.BytesIO(img_bytes))
     text = pytesseract.image_to_string(img)
     return clean_text(text)
@@ -177,6 +204,9 @@ async def upload_document(
 
     except HTTPException:
         raise
+    except RuntimeError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(traceback.format_exc())
         db.rollback()

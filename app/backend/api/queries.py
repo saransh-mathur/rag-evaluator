@@ -89,6 +89,8 @@ class HistoryResponse(BaseModel):
     feedback:    int | None
     starred:     bool
     doc_mode:    bool
+    retrieved_chunks: List[dict] | None = None
+    top_similarity:   float | None = None
 
 
 class SuggestRequest(BaseModel):
@@ -408,19 +410,60 @@ async def get_query_history(
         q = q.filter(QueryHistory.starred == True)
     queries = q.order_by(QueryHistory.created_at.desc()).limit(limit).all()
 
-    return [
-        HistoryResponse(
-            id=q.id,
-            question=q.question,
-            answer=q.answer,
-            created_at=q.created_at.isoformat(),
-            chunk_count=len(json.loads(q.retrieved_chunks_ids or "[]")),
-            feedback=q.feedback,
-            starred=bool(q.starred),
-            doc_mode=bool(q.doc_mode),
+    # Gather all unique chunk IDs
+    all_chunk_ids = set()
+    query_chunk_ids_map = {}
+    for q_hist in queries:
+        try:
+            cids = json.loads(q_hist.retrieved_chunks_ids or "[]")
+        except Exception:
+            cids = []
+        query_chunk_ids_map[q_hist.id] = cids
+        all_chunk_ids.update(cids)
+        
+    # Fetch all chunks in one query
+    chunks_map = {}
+    if all_chunk_ids:
+        chunks = db.query(DocumentChunk).filter(DocumentChunk.id.in_(list(all_chunk_ids))).all()
+        for c in chunks:
+            chunks_map[c.id] = {
+                "chunk_id":    c.id,
+                "filename":    c.document.filename if getattr(c, "document", None) else "unknown",
+                "text":        c.text,
+                "chunk_index": c.chunk_index,
+            }
+
+    results = []
+    for q_hist in queries:
+        cids = query_chunk_ids_map.get(q_hist.id, [])
+        ret_chunks = []
+        for cid in cids:
+            if cid in chunks_map:
+                chunk_info = dict(chunks_map[cid])
+                chunk_info["similarity"] = q_hist.top_similarity or 0.0
+                ret_chunks.append(chunk_info)
+        results.append(
+            HistoryResponse(
+                id=q_hist.id,
+                question=q_hist.question,
+                answer=q_hist.answer,
+                created_at=q_hist.created_at.isoformat(),
+                chunk_count=len(cids),
+                feedback=q_hist.feedback,
+                starred=bool(q_hist.starred),
+                doc_mode=bool(q_hist.doc_mode),
+                retrieved_chunks=ret_chunks,
+                top_similarity=q_hist.top_similarity,
+            )
         )
-        for q in queries
-    ]
+    return results
+
+
+@router.get("/users")
+async def get_users(db: Session = Depends(get_db)):
+    """Get list of all user sessions."""
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return [{"id": u.id, "created_at": u.created_at.isoformat()} for u in users]
 
 
 @router.get("/history/{query_id}")

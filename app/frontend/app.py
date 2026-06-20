@@ -33,6 +33,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Synchronize with browser localStorage to auto-restore session
+st.components.v1.html(
+    """
+    <script>
+    try {
+        var parentUrl = new URL(window.parent.location.href);
+        var sessionId = parentUrl.searchParams.get("session_id");
+        if (sessionId) {
+            localStorage.setItem("rag_session_id", sessionId);
+        } else {
+            var storedId = localStorage.getItem("rag_session_id");
+            if (storedId) {
+                parentUrl.searchParams.set("session_id", storedId);
+                window.parent.location.href = parentUrl.toString();
+            }
+        }
+    } catch (e) {
+        console.log("Local storage sync error:", e);
+    }
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
 # ---------------------------------------------------------------------------
 # CSS
 # ---------------------------------------------------------------------------
@@ -115,7 +140,6 @@ h2,h3{color:var(--text-dim)!important;}
 # Session state
 # ---------------------------------------------------------------------------
 _defaults: dict = {
-    "user_id":       str(uuid.uuid4()),
     "messages":      [],
     "documents":     [],
     "show_history":  False,
@@ -128,6 +152,22 @@ _defaults: dict = {
     "use_rerank":    True,
     "active_collection": "",
 }
+
+# Determine the active session ID from query params
+q_session_id = st.query_params.get("session_id")
+
+if "user_id" not in st.session_state:
+    if q_session_id:
+        print(f"[DEBUG] Found session_id in query parameters: {q_session_id}")
+        st.session_state.user_id = q_session_id
+        st.session_state["_needs_restore"] = True
+    else:
+        new_id = str(uuid.uuid4())
+        print(f"[DEBUG] No session ID in query params. Generating new UUID: {new_id}")
+        st.session_state.user_id = new_id
+        st.query_params["session_id"] = new_id
+        st.session_state["_needs_restore"] = False
+
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -241,6 +281,56 @@ def get_query_history(starred_only: bool = False) -> list:
     except Exception as e:
         st.error(f"Failed to load history: {e}")
         return []
+
+
+def restore_session_chat(user_id: str):
+    print(f"[DEBUG] Restoring chat history for user_id: {user_id}")
+    st.session_state.user_id = user_id
+    history = get_query_history() # fetches past database Q&As
+    chat_msgs = []
+    # history comes sorted desc (newest first). Let's reverse it to have chronological order (oldest first).
+    for q in reversed(history):
+        chat_msgs.append({
+            "role": "user",
+            "content": q["question"],
+            "ts": q["created_at"][11:16] if len(q.get("created_at", "")) > 16 else ""
+        })
+        chat_msgs.append({
+            "role": "assistant",
+            "content": q["answer"],
+            "chunks": q.get("retrieved_chunks", []),
+            "similarity": q.get("top_similarity", 0.0),
+            "query_id": q["id"],
+            "ts": q["created_at"][11:16] if len(q.get("created_at", "")) > 16 else "",
+            "token_usage": None
+        })
+    st.session_state.messages = chat_msgs
+    
+    # Also reload starred and feedback states!
+    st.session_state.starred = set()
+    st.session_state.feedback = {}
+    for q in history:
+        qid = q["id"]
+        if q.get("starred"):
+            st.session_state.starred.add(qid)
+        if q.get("feedback") is not None:
+            st.session_state.feedback[qid] = q["feedback"]
+
+
+def list_users() -> list:
+    try:
+        r = requests.get(f"{API_BASE_URL}/queries/users", timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[DEBUG] Failed to list sessions: {e}")
+        return []
+
+
+# Trigger restoration if needed on startup
+if st.session_state.get("_needs_restore"):
+    st.session_state["_needs_restore"] = False
+    restore_session_chat(st.session_state.user_id)
 
 
 def get_suggestions(question: str, answer: str) -> list[str]:
@@ -586,15 +676,46 @@ with st.sidebar:
     st.markdown('<div class="new-chat-btn">', unsafe_allow_html=True)
     if st.button("＋  New Chat", use_container_width=True, key="new_chat"):
         for k, v in _defaults.items():
-            st.session_state[k] = v if not callable(v) else v()
-        st.session_state.user_id = str(uuid.uuid4())
+            st.session_state[k] = v
+        new_id = str(uuid.uuid4())
+        st.session_state.user_id = new_id
+        st.query_params["session_id"] = new_id
+        print(f"[DEBUG] Starting a new chat session: {new_id}")
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("### 💬 RAG AI Chat")
-    st.caption(f"Session `{st.session_state.user_id[:8]}…`")
+    st.caption("Active Session ID:")
+    st.code(st.session_state.user_id, language="text")
     st.divider()
+
+    # ── Load Past Sessions ──────────────────────────────────────────
+    sessions = list_users()
+    if sessions:
+        session_opts = {s["id"]: f"📂 {s['id'][:8]}… ({s['created_at'][5:16].replace('T', ' ')})" for s in sessions}
+        current_id = st.session_state.user_id
+        options_list = list(session_opts.keys())
+        
+        if current_id not in session_opts:
+            session_opts[current_id] = f"✨ Current Session ({current_id[:8]}…)"
+            options_list = [current_id] + options_list
+            
+        selected_session = st.selectbox(
+            "📂 Switch Session",
+            options=options_list,
+            format_func=lambda x: session_opts.get(x, x),
+            index=options_list.index(current_id) if current_id in options_list else 0,
+            key="session_switch_select"
+        )
+        if selected_session != current_id:
+            st.session_state.user_id = selected_session
+            st.query_params["session_id"] = selected_session
+            print(f"[DEBUG] Switching session via dropdown to: {selected_session}")
+            restore_session_chat(selected_session)
+            load_documents()
+            st.rerun()
+        st.divider()
 
     # ── Collections filter ───────────────────────────────────────────
     collections = load_collections()
@@ -698,6 +819,26 @@ with st.sidebar:
             value=st.session_state.use_rerank,
             help="Re-score retrieved chunks by lexical overlap (combines with vector score)",
         )
+
+        st.divider()
+
+        # Restore Session manually
+        manual_session = st.text_input(
+            "🔑 Restore Session ID",
+            value=st.session_state.user_id,
+            help="Enter a valid Session UUID to reload its history and documents.",
+        )
+        if manual_session and manual_session.strip() != st.session_state.user_id:
+            try:
+                val_uuid = uuid.UUID(manual_session.strip())
+                st.session_state.user_id = str(val_uuid)
+                st.query_params["session_id"] = str(val_uuid)
+                print(f"[DEBUG] Restoring session manually to: {val_uuid}")
+                restore_session_chat(str(val_uuid))
+                load_documents()
+                st.rerun()
+            except ValueError:
+                st.error("Invalid UUID format. Please check the session key.")
 
         st.divider()
 
