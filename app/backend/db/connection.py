@@ -38,8 +38,17 @@ def init_db():
     from .models import Base, UserAccount
     Base.metadata.create_all(bind=engine)
     
-    import hashlib
+    # Run migration checks dynamically
+    from sqlalchemy import text
     db = SessionLocal()
+    try:
+        db.execute(text("ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS custom_instructions TEXT;"))
+        db.execute(text("ALTER TABLE query_history ADD COLUMN IF NOT EXISTS chunk_evaluations TEXT;"))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[DEBUG] Alter table warnings: {e}")
+        
     try:
         # Seed admin
         admin = db.query(UserAccount).filter(UserAccount.username == "admin").first()

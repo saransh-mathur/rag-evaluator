@@ -7,7 +7,7 @@ import logging
 import traceback
 from typing import Iterator, List
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -91,6 +91,7 @@ class HistoryResponse(BaseModel):
     doc_mode:    bool
     retrieved_chunks: List[dict] | None = None
     top_similarity:   float | None = None
+    chunk_evaluations: dict | None = None
 
 
 class SuggestRequest(BaseModel):
@@ -217,11 +218,37 @@ def _ensure_user(db: Session, user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+def run_background_chunk_eval(history_id: int, question: str, chunks: list[dict]):
+    from db.connection import SessionLocal
+    from db.models import QueryHistory
+    from services.generation import evaluate_chunks_relevance
+    import json
+    
+    evals = evaluate_chunks_relevance(question, chunks)
+    
+    db = SessionLocal()
+    try:
+        q = db.query(QueryHistory).filter(QueryHistory.id == history_id).first()
+        if q:
+            q.chunk_evaluations = json.dumps(evals)
+            db.commit()
+            print(f"[DEBUG] Background chunk evaluations stored for query ID {history_id}")
+    except Exception as e:
+        db.rollback()
+        print(f"[DEBUG] Failed to save background chunk evaluations: {e}")
+    finally:
+        db.close()
+
+
 # /ask  (blocking)
 # ---------------------------------------------------------------------------
 
 @router.post("/ask", response_model=QueryResponse)
-async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
+async def ask_question(
+    req: QueryRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
     """Blocking question endpoint."""
     start_time = time.time()
     try:
@@ -238,6 +265,13 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
 
         print(f"[DEBUG] Context built. Size: {len(context)} chars. Chunks retrieved: {len(retrieved_chunks)}")
 
+        custom_ins = None
+        username = req.user_id.split("_")[0] if "_" in req.user_id else req.user_id
+        if username:
+            user_acc = db.query(UserAccount).filter(UserAccount.username == username).first()
+            if user_acc:
+                custom_ins = getattr(user_acc, "custom_instructions", None)
+
         answer, usage = generate_answer(
             question=req.question,
             context=context,
@@ -245,6 +279,7 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
             max_tokens=req.max_tokens,
             chat_history=req.chat_history,
             doc_mode=req.doc_mode,
+            custom_instructions=custom_ins,
         )
 
         retrieved_ids = [c["chunk_id"] for c in retrieved_chunks]
@@ -259,6 +294,9 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
         db.add(history)
         db.commit()
         db.refresh(history)
+
+        # Enqueue chunk relevance evaluation in background
+        background_tasks.add_task(run_background_chunk_eval, history.id, req.question, retrieved_chunks)
 
         print(f"[DEBUG] Query stored successfully. Usage metrics: {usage}")
 
@@ -303,7 +341,11 @@ def _sse(payload: dict) -> str:
 
 
 @router.post("/ask-stream")
-async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
+async def ask_question_stream(
+    req: QueryRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
     """
     Streaming SSE endpoint.
 
@@ -341,6 +383,13 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
                 "top_similarity":   top_similarity,
             })
 
+            custom_ins = None
+            username = req.user_id.split("_")[0] if "_" in req.user_id else req.user_id
+            if username:
+                user_acc = db.query(UserAccount).filter(UserAccount.username == username).first()
+                if user_acc:
+                    custom_ins = getattr(user_acc, "custom_instructions", None)
+
             full_parts: list[str] = []
             for token in generate_answer_stream(
                 question=req.question,
@@ -349,6 +398,7 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
                 max_tokens=req.max_tokens,
                 chat_history=req.chat_history,
                 doc_mode=req.doc_mode,
+                custom_instructions=custom_ins,
             ):
                 full_parts.append(token)
                 yield _sse({"type": "token", "content": token})
@@ -367,6 +417,9 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
             db.add(history)
             db.commit()
             db.refresh(history)
+
+            # Enqueue chunk relevance evaluation in background
+            background_tasks.add_task(run_background_chunk_eval, history.id, req.question, retrieved_chunks)
 
             # Estimate streaming response token usage (Step 3/4)
             from services.generation import _build_prompt
@@ -481,6 +534,7 @@ async def get_query_history(
                 doc_mode=bool(q_hist.doc_mode),
                 retrieved_chunks=ret_chunks,
                 top_similarity=q_hist.top_similarity,
+                chunk_evaluations=json.loads(q_hist.chunk_evaluations or "{}"),
             )
         )
     return results
@@ -522,6 +576,7 @@ async def get_query_detail(query_id: int, db: Session = Depends(get_db)):
             }
             for c in chunks
         ],
+        "chunk_evaluations": json.loads(query.chunk_evaluations or "{}"),
     }
 
 
@@ -717,3 +772,152 @@ async def clear_history(db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database purge failed: {str(e)}")
+
+
+@router.delete("/history/clear-session/{session_id}")
+async def clear_session_history(session_id: str, db: Session = Depends(get_db)):
+    """Clear all chat history for a specific session."""
+    try:
+        db.query(QueryHistory).filter(QueryHistory.user_id == session_id).delete()
+        db.commit()
+        return {"status": "ok", "message": f"History for session '{session_id}' has been cleared successfully."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/admin/users-report")
+async def get_users_report(db: Session = Depends(get_db)):
+    """Fetch detailed statistics for all user accounts."""
+    try:
+        from db.models import UserAccount, User, QueryHistory, Document, SystemMetric
+        accounts = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+        
+        report = []
+        for acc in accounts:
+            username = acc.username
+            sessions = db.query(User).filter(User.id.like(f"{username}_%")).all()
+            session_ids = [s.id for s in sessions]
+            session_ids.append(username)
+            
+            queries_count = db.query(QueryHistory).filter(QueryHistory.user_id.in_(session_ids)).count()
+            starred_count = db.query(QueryHistory).filter(
+                QueryHistory.user_id.in_(session_ids),
+                QueryHistory.starred == True
+            ).count()
+            docs_count = db.query(Document).filter(Document.user_id.in_(session_ids)).count()
+            
+            pos_feedback = db.query(QueryHistory).filter(
+                QueryHistory.user_id.in_(session_ids),
+                QueryHistory.feedback == 1
+            ).count()
+            neg_feedback = db.query(QueryHistory).filter(
+                QueryHistory.user_id.in_(session_ids),
+                QueryHistory.feedback == -1
+            ).count()
+            
+            metrics = db.query(SystemMetric).filter(SystemMetric.username == username).all()
+            total_tokens = sum(m.tokens for m in metrics if m.tokens is not None)
+            avg_latency = 0.0
+            latencies = [m.latency for m in metrics if m.latency is not None and m.latency > 0]
+            if latencies:
+                avg_latency = round(sum(latencies) / len(latencies), 2)
+                
+            report.append({
+                "username": acc.username,
+                "role": acc.role,
+                "created_at": acc.created_at.isoformat(),
+                "sessions_count": len(sessions),
+                "queries_count": queries_count,
+                "starred_count": starred_count,
+                "documents_count": docs_count,
+                "feedback_positive": pos_feedback,
+                "feedback_negative": neg_feedback,
+                "total_tokens": total_tokens,
+                "avg_latency": avg_latency
+            })
+            
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
+
+
+@router.delete("/admin/users/{username}")
+async def delete_user_account(username: str, db: Session = Depends(get_db)):
+    """Delete a user account and purge all their sessions, documents, and query history."""
+    try:
+        account = db.query(UserAccount).filter(UserAccount.username == username).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="User account not found")
+        if username == "admin":
+            raise HTTPException(status_code=400, detail="Cannot delete the root admin account")
+
+        from db.models import SystemMetric, User, Document, DocumentChunk
+        db.query(SystemMetric).filter(SystemMetric.username == username).delete()
+
+        user_sessions = db.query(User).filter(User.id.like(f"{username}_%")).all()
+        session_ids = [s.id for s in user_sessions]
+        session_ids.append(username)
+
+        db.query(QueryHistory).filter(QueryHistory.user_id.in_(session_ids)).delete(synchronize_session=False)
+
+        user_docs = db.query(Document).filter(Document.user_id.in_(session_ids)).all()
+        doc_ids = [d.id for d in user_docs]
+        if doc_ids:
+            db.query(DocumentChunk).filter(DocumentChunk.document_id.in_(doc_ids)).delete(synchronize_session=False)
+            db.query(Document).filter(Document.id.in_(doc_ids)).delete(synchronize_session=False)
+
+        db.query(User).filter(User.id.in_(session_ids)).delete(synchronize_session=False)
+        db.delete(account)
+        db.commit()
+        return {"status": "ok", "message": f"User '{username}' and all associated history/files have been purged successfully."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(e)}")
+
+
+class ChangeRoleRequest(BaseModel):
+    username: str
+    role: str
+
+
+@router.post("/admin/users/change-role")
+async def change_user_role(req: ChangeRoleRequest, db: Session = Depends(get_db)):
+    """Promote or demote a user account."""
+    if req.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'")
+    if req.username == "admin":
+        raise HTTPException(status_code=400, detail="Cannot change the role of the root admin account")
+        
+    user = db.query(UserAccount).filter(UserAccount.username == req.username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+        
+    user.role = req.role
+    db.commit()
+    return {"status": "ok", "message": f"User '{req.username}' role updated to '{req.role}'."}
+
+
+class CustomInstructionsRequest(BaseModel):
+    username: str
+    custom_instructions: str
+
+
+@router.get("/auth/custom-instructions/{username}")
+async def get_custom_instructions(username: str, db: Session = Depends(get_db)):
+    """Fetch custom instructions for a specific user account."""
+    user = db.query(UserAccount).filter(UserAccount.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+    return {"status": "ok", "custom_instructions": user.custom_instructions or ""}
+
+
+@router.post("/auth/custom-instructions")
+async def save_custom_instructions(req: CustomInstructionsRequest, db: Session = Depends(get_db)):
+    """Save or update custom instructions for a user account."""
+    user = db.query(UserAccount).filter(UserAccount.username == req.username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+    user.custom_instructions = req.custom_instructions
+    db.commit()
+    return {"status": "ok", "message": "Custom instructions updated successfully."}

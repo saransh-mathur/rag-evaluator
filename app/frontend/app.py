@@ -297,6 +297,16 @@ def get_query_history(starred_only: bool = False) -> list:
         return []
 
 
+def get_query_detail(query_id: int) -> dict:
+    try:
+        r = requests.get(f"{API_BASE_URL}/queries/history/{query_id}", timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[DEBUG] Failed to load query detail for {query_id}: {e}")
+        return {}
+
+
 def restore_session_chat(user_id: str):
     print(f"[DEBUG] Restoring chat history for user_id: {user_id}")
     st.session_state.user_id = user_id
@@ -316,7 +326,8 @@ def restore_session_chat(user_id: str):
             "similarity": q.get("top_similarity", 0.0),
             "query_id": q["id"],
             "ts": q["created_at"][11:16] if len(q.get("created_at", "")) > 16 else "",
-            "token_usage": None
+            "token_usage": None,
+            "chunk_evaluations": q.get("chunk_evaluations", {})
         })
     st.session_state.messages = chat_msgs
     
@@ -389,6 +400,50 @@ def clear_db_history() -> bool:
     return False
 
 
+def get_users_report() -> list:
+    try:
+        r = requests.get(f"{API_BASE_URL}/queries/admin/users-report", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[DEBUG] Failed to load users report: {e}")
+    return []
+
+
+def delete_user_account(username: str) -> bool:
+    try:
+        r = requests.delete(f"{API_BASE_URL}/queries/admin/users/{username}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return True
+    except Exception as e:
+        print(f"[DEBUG] Failed to delete user: {e}")
+    return False
+
+
+def change_user_role(username: str, role: str) -> bool:
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/queries/admin/users/change-role",
+            json={"username": username, "role": role},
+            timeout=TIMEOUT
+        )
+        if r.status_code == 200:
+            return True
+    except Exception as e:
+        print(f"[DEBUG] Failed to change user role: {e}")
+    return False
+
+
+def clear_current_session_history(session_id: str) -> bool:
+    try:
+        r = requests.delete(f"{API_BASE_URL}/queries/history/clear-session/{session_id}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return True
+    except Exception as e:
+        print(f"[DEBUG] Failed to clear session history: {e}")
+    return False
+
+
 def render_admin_telemetry_ui():
     col_title, col_action = st.columns([3, 1])
     with col_title:
@@ -398,55 +453,171 @@ def render_admin_telemetry_ui():
         st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
         if st.button("🗑️ Purge DB", use_container_width=True, type="primary"):
             confirm_clear_history_modal()
-    
-    metrics = get_admin_metrics()
-    if not metrics:
-        st.info("No metrics logged yet. Try querying or uploading documents.")
-        return
+
+    tab_global, tab_users = st.tabs(["📊 Global Telemetry", "👥 User Management"])
+
+    with tab_global:
+        metrics = get_admin_metrics()
+        if not metrics:
+            st.info("No metrics logged yet. Try querying or uploading documents.")
+        else:
+            # 1. Top row metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("TPM (Tokens/Min)", f"⚡ {metrics.get('tpm', 0)}")
+            c2.metric("RPM (Reqs/Min)", f"🔄 {metrics.get('rpm', 0)}")
+            
+            ocr_success = metrics.get("ocr_success", 0)
+            ocr_failure = metrics.get("ocr_failure", 0)
+            ocr_total = ocr_success + ocr_failure
+            ocr_rate = f"{(ocr_success / ocr_total * 100):.1f}%" if ocr_total > 0 else "N/A"
+            c3.metric("OCR Success Rate", ocr_rate, f"👍 {ocr_success} / 👎 {ocr_failure}")
+            
+            embed_success = metrics.get("embed_success", 0)
+            embed_failure = metrics.get("embed_failure", 0)
+            embed_total = embed_success + embed_failure
+            embed_rate = f"{(embed_success / embed_total * 100):.1f}%" if embed_total > 0 else "N/A"
+            c4.metric("Embedding Rate", embed_rate, f"👍 {embed_success} / 👎 {embed_failure}")
+            
+            st.divider()
+            
+            # 2. Charts comparison
+            st.markdown("#### 📈 Operations Summary")
+            import pandas as pd
+            chart_data = pd.DataFrame({
+                "Success": [ocr_success, embed_success],
+                "Failure": [ocr_failure, embed_failure]
+            }, index=["OCR PDF/Img", "Embedding runs"])
+            st.bar_chart(chart_data)
+            
+            st.divider()
+            
+            # 3. System Metrics Logs table
+            st.markdown("#### 📜 Telemetry Log Traces (Last 100)")
+            logs_data = metrics.get("logs", [])
+            if logs_data:
+                df_logs = pd.DataFrame(logs_data)
+                df_logs = df_logs[["created_at", "event_type", "username", "tokens", "latency", "details"]]
+                df_logs.columns = ["Timestamp", "Event Type", "User", "Tokens", "Latency (s)", "Details"]
+                st.dataframe(df_logs, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No log traces captured yet.")
+
+    with tab_users:
+        st.markdown("#### 👥 User Performance & Account Reports")
+        st.caption("Detailed metrics per registered user account. Manage access, promote to admin, or completely purge accounts.")
         
+        users_data = get_users_report()
+        if not users_data:
+            st.info("No user accounts found.")
+        else:
+            for u in users_data:
+                uname = u["username"]
+                role_icon = "👑" if u["role"] == "admin" else "👤"
+                role_str = u["role"].capitalize()
+                
+                with st.expander(f"{role_icon} {uname} — {role_str} ({u['queries_count']} queries, {u['documents_count']} docs)", expanded=False):
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        st.markdown(
+                            f"""**Account Details:**
+- **Role**: `{u['role']}`
+- **Registered At**: `{u['created_at'].replace('T', ' ')[:19]}`
+- **Active Chat Sessions**: `{u['sessions_count']}`
+- **Total Queries Ran**: `{u['queries_count']}`
+- **Documents Uploaded**: `{u['documents_count']}`
+- **Total Tokens Consumed**: `{u['total_tokens']:,}`
+- **Average LLM Response Latency**: `{u['avg_latency']}s`
+- **Feedback Rating**: 👍 `{u['feedback_positive']}` / 👎 `{u['feedback_negative']}`"""
+                        )
+                    with c2:
+                        st.markdown("**Account Actions:**")
+                        if uname != "admin" and uname != st.session_state.username:
+                            if st.button("🗑️ Purge Account", key=f"del_user_{uname}", use_container_width=True, type="primary"):
+                                confirm_delete_user_modal(uname)
+                                
+                            if u["role"] == "user":
+                                if st.button("👑 Promote to Admin", key=f"promo_{uname}", use_container_width=True):
+                                    if change_user_role(uname, "admin"):
+                                        st.toast(f"Promoted {uname} to Admin!", icon="👑")
+                                        st.rerun()
+                            else:
+                                if st.button("👤 Demote to User", key=f"demote_{uname}", use_container_width=True):
+                                    if change_user_role(uname, "user"):
+                                        st.toast(f"Demoted {uname} to User.", icon="👤")
+                                        st.rerun()
+                        else:
+                            st.info("Root Admin or Currently Logged-in User (Actions Disabled)")
+
+
+def load_custom_instructions(username: str) -> str:
+    try:
+        r = requests.get(f"{API_BASE_URL}/queries/auth/custom-instructions/{username}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return r.json().get("custom_instructions", "")
+    except Exception as e:
+        print(f"[DEBUG] Failed to load custom instructions: {e}")
+    return ""
+
+
+def save_custom_instructions(username: str, instructions: str) -> bool:
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/queries/auth/custom-instructions",
+            json={"username": username, "custom_instructions": instructions},
+            timeout=TIMEOUT
+        )
+        if r.status_code == 200:
+            return True
+    except Exception as e:
+        print(f"[DEBUG] Failed to save custom instructions: {e}")
+    return False
+
+
+def render_custom_instructions_ui():
+    st.markdown("### ✍️ Custom Instructions")
+    st.caption("Help the AI understand your profile and query preferences. These details will be dynamically injected into the LLM system prompts.")
+    
     st.divider()
     
-    # 1. Top row metrics
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("TPM (Tokens/Min)", f"⚡ {metrics.get('tpm', 0)}")
-    c2.metric("RPM (Reqs/Min)", f"🔄 {metrics.get('rpm', 0)}")
+    current_instructions = load_custom_instructions(st.session_state.username)
     
-    ocr_success = metrics.get("ocr_success", 0)
-    ocr_failure = metrics.get("ocr_failure", 0)
-    ocr_total = ocr_success + ocr_failure
-    ocr_rate = f"{(ocr_success / ocr_total * 100):.1f}%" if ocr_total > 0 else "N/A"
-    c3.metric("OCR Success Rate", ocr_rate, f"👍 {ocr_success} / 👎 {ocr_failure}")
-    
-    embed_success = metrics.get("embed_success", 0)
-    embed_failure = metrics.get("embed_failure", 0)
-    embed_total = embed_success + embed_failure
-    embed_rate = f"{(embed_success / embed_total * 100):.1f}%" if embed_total > 0 else "N/A"
-    c4.metric("Embedding Rate", embed_rate, f"👍 {embed_success} / 👎 {embed_failure}")
-    
-    st.divider()
-    
-    # 2. Charts comparison
-    st.markdown("#### 📈 Operations Summary")
-    import pandas as pd
-    chart_data = pd.DataFrame({
-        "Success": [ocr_success, embed_success],
-        "Failure": [ocr_failure, embed_failure]
-    }, index=["OCR PDF/Img", "Embedding runs"])
-    st.bar_chart(chart_data)
-    
-    st.divider()
-    
-    # 3. System Metrics Logs table
-    st.markdown("#### 📜 Telemetry Log Traces (Last 100)")
-    logs_data = metrics.get("logs", [])
-    if logs_data:
-        df_logs = pd.DataFrame(logs_data)
-        # Reorder and rename columns for readability
-        df_logs = df_logs[["created_at", "event_type", "username", "tokens", "latency", "details"]]
-        df_logs.columns = ["Timestamp", "Event Type", "User", "Tokens", "Latency (s)", "Details"]
-        st.dataframe(df_logs, use_container_width=True, hide_index=True)
+    part1 = ""
+    part2 = ""
+    if "|||" in current_instructions:
+        parts = current_instructions.split("|||", 1)
+        part1 = parts[0].strip()
+        part2 = parts[1].strip()
     else:
-        st.caption("No log traces captured yet.")
+        part1 = current_instructions
+        
+    st.markdown("##### 👤 What would you like the AI to know about you to provide better responses?")
+    p1 = st.text_area(
+        "Who are you, what do you work on, or what is your typical workflow?",
+        value=part1,
+        placeholder="e.g. I am a software engineer studying machine learning datasets. Explain concepts with high technical detail. / I am a business analyst writing summaries for executives.",
+        height=150,
+        help="Provide context about your background, expertise, or the project you are working on."
+    )
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("##### 🎭 How would you like the AI to respond?")
+    p2 = st.text_area(
+        "Format, tone, styling, or length preferences?",
+        value=part2,
+        placeholder="e.g. Keep answers objective and factual. Format equations in LaTeX. Use bullet points and summary tables when appropriate.",
+        height=150,
+        help="Specify tone, language, detail level, formatting rules, or boundaries (e.g. 'explain simply', 'keep it under 300 words')."
+    )
+    
+    st.divider()
+    
+    if st.button("💾 Save Instructions", use_container_width=True, type="primary"):
+        combined = f"{p1.strip()}\n|||\n{p2.strip()}" if p2.strip() else p1.strip()
+        if save_custom_instructions(st.session_state.username, combined):
+            st.toast("Custom instructions saved successfully!", icon="💾")
+            st.success("✅ Saved! These rules will guide the assistant's future answers.")
+        else:
+            st.error("Failed to save custom instructions.")
 
 
 # Trigger restoration if needed on startup
@@ -584,21 +755,68 @@ def _chunk_badge(n: int) -> str:
     return       f'<span class="chunk-badge-red">● {n}</span>'
 
 
-def render_sources(chunks: list):
+def render_sources(chunks: list, chunk_evaluations: dict = None):
     if not chunks:
         return
+    
+    is_admin = st.session_state.get("role") == "admin"
+    
     with st.expander(f"📚 {len(chunks)} source chunk(s) used", expanded=False):
         for chunk in chunks:
             pct   = int(chunk["similarity"] * 100)
             color = "#4a9eff" if pct >= 70 else "#f0a500" if pct >= 50 else "#6a8aaf"
+            
+            # If admin, evaluate the chunk relevance
+            eval_html = ""
+            border_style = ""
+            
+            if is_admin:
+                cid = str(chunk.get("chunk_id") or chunk.get("id") or "")
+                eval_info = None
+                if chunk_evaluations:
+                    eval_info = chunk_evaluations.get(cid)
+                    if not eval_info and cid.isdigit():
+                        eval_info = chunk_evaluations.get(int(cid))
+                
+                if eval_info:
+                    relevance = eval_info.get("relevance", 3)
+                    reason = eval_info.get("reason", "No explanation provided.")
+                    
+                    if relevance >= 4:
+                        eval_color = "#28a745" # Green
+                        eval_text = f"🟢 Highly Useful (Score: {relevance}/5)"
+                        border_style = f"border-left: 5px solid {eval_color};"
+                    elif relevance >= 2:
+                        eval_color = "#ffc107" # Yellow
+                        eval_text = f"🟡 Partially Useful (Score: {relevance}/5)"
+                        border_style = f"border-left: 5px solid {eval_color};"
+                    else:
+                        eval_color = "#dc3545" # Red
+                        eval_text = f"🔴 Irrelevant / Low Utility (Score: {relevance}/5)"
+                        border_style = f"border-left: 5px solid {eval_color};"
+                        
+                    eval_html = f"""
+                    <div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); font-size: 0.8rem;">
+                        <span style="font-weight: 600; color: {eval_color};">{eval_text}</span>
+                        <div style="color: var(--text-dim); margin-top: 2px;"><b>Judge explanation:</b> {reason}</div>
+                    </div>
+                    """
+                else:
+                    eval_html = """
+                    <div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); font-size: 0.8rem; color: var(--text-mute);">
+                        ⏳ <i>Chunk relevance evaluation running in background... Rerun/interact to update.</i>
+                    </div>
+                    """
+            
             st.markdown(
-                f"""<div class="source-card">
+                f"""<div class="source-card" style="{border_style}">
                     <div class="src-header">📄 {chunk['filename']}</div>
                     <div class="src-text">{chunk['text']}</div>
                     <div class="src-bar-bg">
                       <div class="src-bar-fill" style="width:{pct}%;background:{color}"></div>
                     </div>
                     <small style="color:{color}">Similarity {pct}%</small>
+                    {eval_html}
                 </div>""",
                 unsafe_allow_html=True,
             )
@@ -637,7 +855,27 @@ def render_message(msg: dict, idx: int):
 
             # Sources
             if msg.get("chunks"):
-                render_sources(msg["chunks"])
+                evals = msg.get("chunk_evaluations")
+                
+                # If we are admin and evaluations are empty/missing, try fetching from the database
+                if st.session_state.get("role") == "admin" and not evals and qid:
+                    detail = get_query_detail(qid)
+                    if detail and detail.get("chunk_evaluations"):
+                        evals = detail["chunk_evaluations"]
+                        msg["chunk_evaluations"] = evals  # cache it in message dict
+                
+                # If still not ready and we are admin, show a refresh button
+                if st.session_state.get("role") == "admin" and not evals and qid:
+                    if st.button("🔄 Refresh Evaluations", key=f"ref_eval_{idx}_{qid}"):
+                        detail = get_query_detail(qid)
+                        if detail and detail.get("chunk_evaluations"):
+                            msg["chunk_evaluations"] = detail["chunk_evaluations"]
+                            st.toast("Evaluations loaded!", icon="✅")
+                            st.rerun()
+                        else:
+                            st.toast("Evaluation still running. Please wait a second and try again.", icon="⏳")
+
+                render_sources(msg["chunks"], chunk_evaluations=evals)
 
             # Feedback + star
             if qid:
@@ -860,6 +1098,29 @@ def confirm_clear_history_modal():
             st.rerun()
 
 
+@st.dialog("⚠️ Confirm User Deletion")
+def confirm_delete_user_modal(username: str):
+    st.markdown(
+        f"<div style='margin-bottom:16px;line-height:1.6;color:var(--text-dim);'>"
+        f"Are you sure you want to permanently delete the user account <b>'{username}'</b>?"
+        f"<br><br>This will <b>completely purge</b> all their documents, session histories, chat logs, and telemetry traces from the database."
+        f"<br><br><span style='color:var(--error);font-weight:bold;'>⚠️ This action is irreversible.</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+    col_yes, col_no = st.columns(2)
+    with col_yes:
+        if st.button("🔴 Purge User Account", use_container_width=True, type="primary"):
+            if delete_user_account(username):
+                st.toast(f"User {username} deleted successfully!", icon="🗑️")
+                st.rerun()
+            else:
+                st.error("Failed to delete user account.")
+    with col_no:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+
+
 # ── Login Page ───────────────────────────────────────────────────────────
 if not st.session_state.get("logged_in"):
     _, col_login, _ = st.columns([1, 2, 1])
@@ -952,10 +1213,12 @@ with st.sidebar:
         unsafe_allow_html=True
     )
     
-    # Console View Selector for Admin
+    # Workspace View Selector
+    views = ["💬 Chat Sandbox", "✍️ Custom Instructions"]
     if st.session_state.role == "admin":
-        st.radio("Console View", ["💬 Chat Sandbox", "📊 Telemetry Dashboard"], key="admin_view_selector")
-        st.divider()
+        views.append("📊 Telemetry Dashboard")
+    st.radio("Workspace View", views, key="workspace_view_selector")
+    st.divider()
         
     if st.button("🚪 Log Out", use_container_width=True, key="logout_btn"):
         st.session_state.logged_in = False
@@ -1017,6 +1280,13 @@ with st.sidebar:
             restore_session_chat(selected_session)
             load_documents()
             st.rerun()
+            
+        if st.button("🧹 Clear Chat History", use_container_width=True, key="clear_sess_hist"):
+            if clear_current_session_history(current_id):
+                st.session_state.messages = []
+                st.session_state.suggestions = []
+                st.toast("Chat history cleared!", icon="🧹")
+                st.rerun()
         st.divider()
 
     # ── Collections filter ───────────────────────────────────────────
@@ -1282,8 +1552,13 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
-if st.session_state.role == "admin" and st.session_state.get("admin_view_selector") == "📊 Telemetry Dashboard":
+active_view = st.session_state.get("workspace_view_selector", "💬 Chat Sandbox")
+
+if active_view == "📊 Telemetry Dashboard" and st.session_state.role == "admin":
     render_admin_telemetry_ui()
+    st.stop()
+elif active_view == "✍️ Custom Instructions":
+    render_custom_instructions_ui()
     st.stop()
 
 st.markdown(
@@ -1451,7 +1726,16 @@ if user_input:
             unsafe_allow_html=True,
         )
 
-        render_sources(chunks)
+        # Check if we can fetch evaluations if admin (giving a split second for bg task)
+        evals = None
+        if st.session_state.get("role") == "admin" and qid:
+            import time
+            time.sleep(0.3)
+            detail = get_query_detail(qid)
+            if detail and detail.get("chunk_evaluations"):
+                evals = detail["chunk_evaluations"]
+
+        render_sources(chunks, chunk_evaluations=evals)
         st.markdown(f'<div class="msg-ts">{ts_now}</div>', unsafe_allow_html=True)
 
         # Feedback + star
@@ -1481,6 +1765,7 @@ if user_input:
         "query_id": qid,
         "ts":       ts_now,
         "token_usage": usage,
+        "chunk_evaluations": evals,
     })
 
     # Follow-up suggestions

@@ -65,6 +65,7 @@ class QueryHistory(Base):
     starred              = Column(Boolean, default=False)   # pinned/starred
     doc_mode             = Column(Boolean, default=True)    # document vs general mode
     created_at           = Column(DateTime, default=datetime.utcnow)
+    chunk_evaluations    = Column(Text, nullable=True)
 
     user = relationship("User", back_populates="queries")
 
@@ -73,10 +74,11 @@ class UserAccount(Base):
     """Admin and User accounts for login authentication."""
     __tablename__ = "user_accounts"
 
-    username      = Column(String(100), primary_key=True)
-    password_hash = Column(String(255), nullable=False)
-    role          = Column(String(20), default="user") # "admin" or "user"
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    username            = Column(String(100), primary_key=True)
+    password_hash       = Column(String(255), nullable=False)
+    role                = Column(String(20), default="user") # "admin" or "user"
+    custom_instructions = Column(Text, nullable=True)
+    created_at          = Column(DateTime, default=datetime.utcnow)
 
 
 class SystemMetric(Base):

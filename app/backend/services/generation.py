@@ -55,6 +55,7 @@ def _build_prompt(
     context: str,
     chat_history: list[dict] | None = None,
     doc_mode: bool = True,
+    custom_instructions: str | None = None,
 ) -> list[dict]:
     """
     Build the messages list for the OpenAI-compatible API.
@@ -66,9 +67,13 @@ def _build_prompt(
             "You are a helpful assistant. Answer the question thoroughly based ONLY "
             "on the provided context. If the answer is not present, state that you do not know."
         )
+        if custom_instructions and custom_instructions.strip():
+            system += f"\n\nUser Custom Instructions:\n{custom_instructions}"
         user_content = f"Context:\n{context}\n\nQuestion: {question}"
     else:
         system = "You are a helpful assistant. Answer the question thoroughly."
+        if custom_instructions and custom_instructions.strip():
+            system += f"\n\nUser Custom Instructions:\n{custom_instructions}"
         user_content = question
 
     messages: list[dict] = [{"role": "system", "content": system}]
@@ -92,6 +97,7 @@ def generate_answer(
     max_tokens: int = 2048,
     chat_history: list[dict] | None = None,
     doc_mode: bool = True,
+    custom_instructions: str | None = None,
 ) -> tuple[str, dict]:
     """
     Generate a complete answer (non-streaming).
@@ -103,13 +109,14 @@ def generate_answer(
         max_tokens:   Upper bound on tokens to generate
         chat_history: Previous turns for multi-turn conversations
         doc_mode:     If True, constrain answer to context
+        custom_instructions: User custom instructions to guide LLM response
 
     Returns:
         Tuple of (Clean answer string, usage dictionary)
     """
     try:
         effective_tokens = _dynamic_max_tokens(question, max_tokens)
-        messages = _build_prompt(question, context, chat_history, doc_mode)
+        messages = _build_prompt(question, context, chat_history, doc_mode, custom_instructions)
         response = _client().chat.completions.create(
             model=GEN_MODEL,
             messages=messages,
@@ -137,6 +144,7 @@ def generate_answer_stream(
     max_tokens: int = 2048,
     chat_history: list[dict] | None = None,
     doc_mode: bool = True,
+    custom_instructions: str | None = None,
 ) -> Iterator[str]:
     """
     Stream answer tokens, with think-tag filtering applied on-the-fly.
@@ -145,7 +153,7 @@ def generate_answer_stream(
     """
     try:
         effective_tokens = _dynamic_max_tokens(question, max_tokens)
-        messages = _build_prompt(question, context, chat_history, doc_mode)
+        messages = _build_prompt(question, context, chat_history, doc_mode, custom_instructions)
         stream = _client().chat.completions.create(
             model=GEN_MODEL,
             messages=messages,
@@ -323,3 +331,92 @@ def generate_search_autocomplete(partial: str, past_questions: list[str]) -> lis
         if partial_lower in q.lower() and q.lower() != partial_lower
     ]
     return matches[:5]
+
+
+def evaluate_chunks_relevance(
+    question: str,
+    chunks: list[dict]
+) -> dict:
+    """
+    Assess the relevance of retrieved chunks to a question using the LLM.
+    Returns a dict mapping chunk ID (str) to a dict with 'relevance' (1-5) and 'reason'.
+    """
+    import json
+    evaluations = {}
+    try:
+        chunks_str = ""
+        for c in chunks:
+            text_val = c.get("text", "") or c.get("chunk_text", "")
+            cid = c.get("chunk_id") or c.get("id")
+            chunks_str += f"--- CHUNK ID: {cid} ---\n{text_val}\n\n"
+            
+        prompt = (
+            f"You are a search relevance evaluator judge.\n"
+            f"Question: {question}\n\n"
+            f"Retrieved Chunks:\n{chunks_str}\n"
+            f"Evaluate the relevance of each retrieved chunk to the question. "
+            f"For each CHUNK ID, assign a relevance score between 1 (completely irrelevant) and 5 (highly relevant and directly answers the question) and a short reason explaining your rating.\n"
+            f"You MUST respond ONLY with a JSON object in this exact format:\n"
+            f"{{\n"
+            f"  \"chunk_id_here\": {{\n"
+            f"    \"relevance\": 5,\n"
+            f"    \"reason\": \"Contains the exact definition requested.\"\n"
+            f"  }}\n"
+            f"}}\n"
+            f"Do not add any preamble, markdown code blocks, or extra text. Return valid JSON only."
+        )
+        
+        response = _client().chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        raw = response.choices[0].message.content or ""
+        clean_raw = raw.strip()
+        if clean_raw.startswith("```json"):
+            clean_raw = clean_raw[7:]
+        if clean_raw.endswith("```"):
+            clean_raw = clean_raw[:-3]
+        clean_raw = clean_raw.strip()
+        
+        try:
+            evaluations = json.loads(clean_raw)
+        except Exception as json_err:
+            # Fallback regex parsing to tolerate missing commas, preambles, etc.
+            evaluations = {}
+            import re
+            matches = re.finditer(r'"([^"]+)"\s*:\s*\{([^}]+)\}', clean_raw)
+            for m in matches:
+                cid = m.group(1)
+                body = m.group(2)
+                
+                rel_match = re.search(r'"relevance"\s*:\s*(\d+)', body)
+                rel = int(rel_match.group(1)) if rel_match else 3
+                
+                reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', body)
+                reason = reason_match.group(1) if reason_match else "No explanation provided."
+                
+                evaluations[cid] = {
+                    "relevance": rel,
+                    "reason": reason
+                }
+            
+            if not evaluations:
+                raise json_err
+    except Exception as e:
+        import traceback
+        try:
+            with open("/home/saranh/projects/rag-evaluator/app/eval_error.log", "w") as f:
+                f.write(f"Exception: {str(e)}\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        print(f"[DEBUG] Chunk evaluation failed: {e}")
+        for c in chunks:
+            cid = str(c.get("chunk_id") or c.get("id"))
+            evaluations[cid] = {
+                "relevance": 3,
+                "reason": f"Evaluation unavailable (error: {str(e)})."
+            }
+    return evaluations
