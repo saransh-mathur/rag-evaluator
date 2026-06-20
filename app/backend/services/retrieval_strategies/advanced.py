@@ -191,23 +191,45 @@ class AdvancedPipeline:
         top_k: int,
         user_id: str | None,
     ) -> list[tuple[DocumentChunk, float]]:
-        base_q = db.query(DocumentChunk)
-        if user_id:
-            base_q = (
-                base_q
-                .join(Document, DocumentChunk.document_id == Document.id)
-                .filter(Document.user_id == user_id)
-            )
+        try:
+            from sqlalchemy import func
+            tsvector = func.to_tsvector('english', DocumentChunk.text)
+            tsquery = func.plainto_tsquery('english', query)
+            rank_expr = func.ts_rank_cd(tsvector, tsquery)
 
-        chunks = base_q.all()
-        scores = _bm25_score(query, chunks)
-        ranked = sorted(
-            zip(chunks, scores),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        return [
-            (chunk, round(float(score), 4))
-            for chunk, score in ranked[:top_k]
-            if float(score) > 0.0
-        ]
+            base_q = db.query(DocumentChunk, rank_expr.label("rank")).filter(tsvector.op("@@")(tsquery))
+            if user_id:
+                base_q = (
+                    base_q
+                    .join(Document, DocumentChunk.document_id == Document.id)
+                    .filter(Document.user_id == user_id)
+                )
+
+            rows = base_q.order_by(rank_expr.desc()).limit(top_k).all()
+            return [
+                (chunk, round(float(rank), 4))
+                for chunk, rank in rows
+            ]
+        except Exception as e:
+            logger.warning("PostgreSQL FTS failed; falling back to in-memory BM25: %s", e)
+            base_q = db.query(DocumentChunk)
+            if user_id:
+                base_q = (
+                    base_q
+                    .join(Document, DocumentChunk.document_id == Document.id)
+                    .filter(Document.user_id == user_id)
+                )
+
+            chunks = base_q.all()
+            scores = _bm25_score(query, chunks)
+            ranked = sorted(
+                zip(chunks, scores),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            return [
+                (chunk, round(float(score), 4))
+                for chunk, score in ranked[:top_k]
+                if float(score) > 0.0
+            ]
+

@@ -44,8 +44,7 @@ def ask_backend(
 ) -> dict:
     """
     Call POST /api/queries/ask and return the parsed JSON response.
-
-    Returns a dict with keys: question, answer, retrieved_chunks, top_similarity, query_id
+    Includes exponential backoff retries to handle rate limits gracefully.
     """
     url = f"{api_url.rstrip('/')}/api/queries/ask"
     payload = {
@@ -55,13 +54,44 @@ def ask_backend(
         "strategy": strategy,
         "temperature": 0.1,
     }
-    start_time = time.time()
-    resp = requests.post(url, json=payload, timeout=300)
-    latency = time.time() - start_time
-    resp.raise_for_status()
-    data = resp.json()
-    data["latency"] = latency
-    return data
+    
+    max_retries = 6
+    retry_delay = 6.0
+    
+    for attempt in range(max_retries):
+        try:
+            start_time = time.time()
+            resp = requests.post(url, json=payload, timeout=300)
+            if resp.status_code == 429:
+                sleep_time = retry_delay * (2 ** attempt)
+                print(f"    Rate limited (429). Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            data["latency"] = time.time() - start_time
+            return data
+        except requests.exceptions.HTTPError as http_err:
+            if resp.status_code == 500:
+                # Under free tiers, the backend may wrap the RateLimitError inside a 500
+                sleep_time = retry_delay * (2 ** attempt)
+                print(f"    Possible rate limit (500) from backend. Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                continue
+            if attempt < max_retries - 1:
+                sleep_time = retry_delay * (2 ** attempt)
+                print(f"    HTTP error {resp.status_code}. Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                continue
+            raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                sleep_time = retry_delay * (2 ** attempt)
+                print(f"    Error: {e}. Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                continue
+            raise
+
 
 
 def run_evaluation(

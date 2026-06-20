@@ -191,7 +191,7 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
 
         context, retrieved_chunks, top_similarity = _build_context_and_chunks(db, req)
 
-        answer = generate_answer(
+        answer, usage = generate_answer(
             question=req.question,
             context=context,
             temperature=req.temperature,

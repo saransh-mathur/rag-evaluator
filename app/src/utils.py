@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
+from dotenv import load_dotenv
+
+APP_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(APP_DIR / ".env")
 
 
 def read_json(path: Path | str) -> Any:
@@ -60,6 +66,45 @@ def retrieval_hit(retrieved_text: str, expected_phrases: list[str]) -> bool:
 def answer_hit(generated: str, expected_phrases: list[str]) -> bool:
     if not expected_phrases:
         return True
+
+    # Try LLM-as-a-Judge first
+    try:
+        from openai import OpenAI
+        api_key = os.getenv("GEN_API_KEY")
+        if api_key:
+            client = OpenAI(
+                base_url=os.getenv("GEN_BASE_URL", "http://localhost:11434/v1"),
+                api_key=api_key,
+            )
+            model = os.getenv("GEN_MODEL", "gemma4:12b")
+            phrases_str = "\n".join(f"- {p}" for p in expected_phrases)
+            prompt = (
+                "You are an objective AI grader. You will judge if a Student Answer semantically "
+                "contains all of the expected facts listed below.\n\n"
+                "Expected Facts:\n"
+                f"{phrases_str}\n\n"
+                f"Student Answer:\n{generated}\n\n"
+                "Respond with a single word: 'YES' if all expected facts are semantically covered "
+                "in the student's answer, or 'NO' if any expected fact is missing or contradicted. "
+                "Do not write any other explanation or words."
+            )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=10,
+                timeout=15,
+            )
+            res = response.choices[0].message.content or ""
+            res_clean = re.sub(r"<think>.*?</think>", "", res, flags=re.DOTALL).strip().upper()
+            if "YES" in res_clean:
+                return True
+            elif "NO" in res_clean:
+                return False
+    except Exception:
+        pass
+
+    # Fallback to substring matching
     return contains_all(generated, expected_phrases)
 
 
@@ -68,9 +113,47 @@ def hallucination_flag(
     context: str,
     expected_phrases: list[str],
 ) -> bool:
-    """True when the answer misses expected facts but still looks confident."""
-    if answer_hit(generated, expected_phrases):
-        return False
+    """True when the answer misses expected facts or fails groundness checks."""
     if not generated.strip():
+        return False
+
+    # Try LLM-as-a-Judge first
+    try:
+        from openai import OpenAI
+        api_key = os.getenv("GEN_API_KEY")
+        if api_key:
+            client = OpenAI(
+                base_url=os.getenv("GEN_BASE_URL", "http://localhost:11434/v1"),
+                api_key=api_key,
+            )
+            model = os.getenv("GEN_MODEL", "gemma4:12b")
+            prompt = (
+                "You are an objective AI grader. You will compare a Generated Answer with the retrieved Source Context.\n\n"
+                f"Source Context:\n{context}\n\n"
+                f"Generated Answer:\n{generated}\n\n"
+                "Check if the generated answer contains assertions or claims that are unsupported by, contradicted by, "
+                "or completely missing from the Source Context.\n"
+                "Respond with a single word: 'YES' if the generated answer contains hallucinations (claims unsupported "
+                "by the context), or 'NO' if the generated answer is completely grounded in the context. "
+                "Do not write any other explanation or words."
+            )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=10,
+                timeout=15,
+            )
+            res = response.choices[0].message.content or ""
+            res_clean = re.sub(r"<think>.*?</think>", "", res, flags=re.DOTALL).strip().upper()
+            if "YES" in res_clean:
+                return True
+            elif "NO" in res_clean:
+                return False
+    except Exception:
+        pass
+
+    # Fallback to the original substring check
+    if answer_hit(generated, expected_phrases):
         return False
     return not contains_any(generated, expected_phrases)
