@@ -113,7 +113,7 @@ async def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": os.getenv("GEN_MODEL", "gemma4:12b"), "object": "model", "owned_by": "ollama"},
+            {"id": os.getenv("GEN_MODEL", "qwen2.5:1.5b-instruct"), "object": "model", "owned_by": "ollama"},
             {"id": os.getenv("EMBED_MODEL", "nomic-embed-text-v2-moe"), "object": "model", "owned_by": "ollama"}
         ]
     }

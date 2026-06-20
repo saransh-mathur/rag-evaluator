@@ -658,7 +658,9 @@ with st.sidebar:
 
     # ── Settings ────────────────────────────────────────────────────
     with st.expander("⚙️ Settings", expanded=False):
-        top_k       = st.slider("Chunks to retrieve",    1, 12, 8)
+        import os
+        default_top_k = int(os.getenv("TOP_K", 3))
+        top_k       = st.slider("Chunks to retrieve",    1, 12, default_top_k)
         temperature = st.slider("Creativity",            0.0, 1.0, 0.1, step=0.05)
         max_tokens  = st.slider("Max response length",   256, 4096, 2048, step=256)
 

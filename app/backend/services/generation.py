@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEN_BASE_URL = os.getenv("GEN_BASE_URL", "http://localhost:11434/v1")
-GEN_MODEL    = os.getenv("GEN_MODEL",     "gemma4:12b")
+GEN_MODEL    = os.getenv("GEN_MODEL",     "qwen2.5:1.5b-instruct")
 GEN_API_KEY  = os.getenv("GEN_API_KEY", os.getenv("GEMINI_API_KEY", "ollama"))
 
 # ---------------------------------------------------------------------------
@@ -63,28 +63,19 @@ def _build_prompt(
     """
     if doc_mode and context.strip():
         system = (
-            "You are a knowledgeable assistant. Give thorough, well-structured answers "
-            "based on the provided context. Guidelines:\n"
-            "- Answer in as much detail as the context supports\n"
-            "- Use bullet points, numbered lists, or headers where they aid clarity\n"
-            "- Start with a one-sentence TL;DR, then elaborate\n"
-            "- Quote or reference source labels when relevant\n"
-            "- If context only partially answers, state what is and isn't covered\n"
-            "- Do not fabricate information not present in the context"
+            "You are a helpful assistant. Answer the question thoroughly based ONLY "
+            "on the provided context. If the answer is not present, state that you do not know."
         )
         user_content = f"Context:\n{context}\n\nQuestion: {question}"
     else:
-        system = (
-            "You are a knowledgeable assistant. Answer thoroughly and clearly. "
-            "Use structure (headers, bullets) where it aids understanding."
-        )
+        system = "You are a helpful assistant. Answer the question thoroughly."
         user_content = question
 
     messages: list[dict] = [{"role": "system", "content": system}]
 
     if chat_history:
-        # Keep last 6 turns to avoid context overflow
-        messages.extend(chat_history[-6:])
+        # Keep last 2 turns to minimize input token consumption
+        messages.extend(chat_history[-2:])
 
     messages.append({"role": "user", "content": user_content})
     return messages
