@@ -25,6 +25,7 @@ from services.retrieval_strategies import (
     get_retrieval_strategy,
     list_retrieval_strategies,
 )
+from services.query_processing import determine_query_route
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/queries", tags=["queries"])
@@ -76,6 +77,7 @@ class QueryResponse(BaseModel):
     query_id:         int
     doc_mode:         bool
     strategy:         str
+    token_usage:      dict | None = None
 
 
 class HistoryResponse(BaseModel):
@@ -109,6 +111,37 @@ class StarRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Shared retrieval + context builder
 # ---------------------------------------------------------------------------
+
+def compress_chunk_text(text: str, query: str) -> str:
+    """
+    Split the chunk text into sentences and keep only the sentences
+    that contain any of the alphanumeric keywords from the query.
+    """
+    import re
+    # Extract clean alphanumeric keywords from query
+    query_words = set(re.findall(r"\w+", query.lower()))
+    if not query_words:
+        return text
+
+    # Simple sentence splitter
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    matched_sentences = []
+    for sent in sentences:
+        sent_words = set(re.findall(r"\w+", sent.lower()))
+        # If there's overlap in words, keep the sentence
+        if query_words.intersection(sent_words):
+            matched_sentences.append(sent)
+
+    if not matched_sentences:
+        # Fallback to first 2 sentences if no keywords match
+        fallback = " ".join(sentences[:2])
+        print(f"[DEBUG] No keywords matched. Fallback to start: {len(fallback)} chars.")
+        return fallback
+        
+    compressed = " ".join(matched_sentences)
+    print(f"[DEBUG] Compressed chunk text size from {len(text)} to {len(compressed)} chars.")
+    return compressed
+
 
 def _build_context_and_chunks(
     db: Session,
@@ -153,15 +186,18 @@ def _build_context_and_chunks(
             if getattr(chunk, "document", None) else None
         ) or "unknown"
 
+        # Apply Sentence-level Keyword Compression (Step 2)
+        compressed_text = compress_chunk_text(chunk.text, req.question)
+
         # Contextual header prepended to each chunk
         header = f"[Source: {filename}, chunk {chunk.chunk_index + 1}]"
-        context_parts.append(f"{header}\n{chunk.text}")
+        context_parts.append(f"{header}\n{compressed_text}")
 
         retrieved_chunks.append({
             "chunk_id":    chunk.id,
             "document_id": chunk.document_id,
             "filename":    filename,
-            "text":        (chunk.text[:200] + "…") if len(chunk.text or "") > 200 else (chunk.text or ""),
+            "text":        (compressed_text[:200] + "…") if len(compressed_text or "") > 200 else (compressed_text or ""),
             "similarity":  round(float(similarity), 4),
         })
 
@@ -189,7 +225,15 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
         _check_rate_limit(req.user_id)
         _ensure_user(db, req.user_id)
 
+        # Check Query Router (Step 1)
+        route = determine_query_route(req.question)
+        if route == "GENERAL":
+            print(f"[DEBUG] Routing bypassed RAG context for question: '{req.question[:50]}'")
+            req.doc_mode = False
+
         context, retrieved_chunks, top_similarity = _build_context_and_chunks(db, req)
+
+        print(f"[DEBUG] Context built. Size: {len(context)} chars. Chunks retrieved: {len(retrieved_chunks)}")
 
         answer, usage = generate_answer(
             question=req.question,
@@ -213,6 +257,8 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(history)
 
+        print(f"[DEBUG] Query stored successfully. Usage metrics: {usage}")
+
         return QueryResponse(
             question=req.question,
             answer=answer,
@@ -221,6 +267,7 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
             query_id=history.id,
             doc_mode=req.doc_mode,
             strategy=(req.strategy or DEFAULT_RETRIEVAL_STRATEGY).lower(),
+            token_usage=usage,
         )
 
     except HTTPException:
@@ -261,7 +308,15 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
         try:
             _ensure_user(db, req.user_id)
 
+            # Check Query Router (Step 1)
+            route = determine_query_route(req.question)
+            if route == "GENERAL":
+                print(f"[DEBUG] Streaming routing bypassed RAG context for question: '{req.question[:50]}'")
+                req.doc_mode = False
+
             context, retrieved_chunks, top_similarity = _build_context_and_chunks(db, req)
+
+            print(f"[DEBUG] Streaming context built. Size: {len(context)} chars. Chunks: {len(retrieved_chunks)}")
 
             yield _sse({
                 "type":             "sources",
@@ -296,7 +351,26 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
             db.commit()
             db.refresh(history)
 
-            yield _sse({"type": "done", "query_id": history.id})
+            # Estimate streaming response token usage (Step 3/4)
+            from services.generation import _build_prompt
+            messages = _build_prompt(req.question, context, req.chat_history, req.doc_mode)
+            prompt_text = "".join(m["content"] for m in messages)
+            prompt_tokens = len(prompt_text) // 4
+            completion_tokens = len(full_answer) // 4
+            total_tokens = prompt_tokens + completion_tokens
+            
+            usage_dict = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens
+            }
+            print(f"[DEBUG] Streaming complete. Usage: {usage_dict}")
+
+            yield _sse({
+                "type": "done",
+                "query_id": history.id,
+                "token_usage": usage_dict
+            })
 
         except Exception:
             logger.error(traceback.format_exc())

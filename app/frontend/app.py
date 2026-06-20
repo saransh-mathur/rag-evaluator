@@ -313,6 +313,7 @@ def stream_question(question: str, top_k: int, temperature: float, max_tokens: i
     st.session_state["_pending_chunks"]     = []
     st.session_state["_pending_similarity"] = 0.0
     st.session_state["_pending_query_id"]   = None
+    st.session_state["_pending_token_usage"] = None
 
     with requests.post(
         f"{API_BASE_URL}/queries/ask-stream",
@@ -333,6 +334,7 @@ def stream_question(question: str, top_k: int, temperature: float, max_tokens: i
                 yield event["content"]
             elif event["type"] == "done":
                 st.session_state["_pending_query_id"] = event["query_id"]
+                st.session_state["_pending_token_usage"] = event.get("token_usage")
             elif event["type"] == "error":
                 raise RuntimeError(event.get("detail", "Streaming error"))
 
@@ -388,6 +390,16 @@ def render_message(msg: dict, idx: int):
 
         if msg["role"] == "assistant":
             qid = msg.get("query_id")
+            
+            usage = msg.get("token_usage")
+            if usage:
+                st.markdown(
+                    f"<div style='font-size:0.75rem;color:var(--text-mute);margin-bottom:8px;'>"
+                    f"⚡ Tokens: <b>{usage.get('total_tokens', 0)}</b> "
+                    f"(Prompt: {usage.get('prompt_tokens', 0)} | "
+                    f"Completion: {usage.get('completion_tokens', 0)})</div>",
+                    unsafe_allow_html=True,
+                )
 
             # Copy — store content in hidden span, read from JS (avoids escaping issues)
             copy_id = f"copy_src_{idx}"
@@ -878,6 +890,16 @@ if user_input:
         chunks = st.session_state.pop("_pending_chunks", [])
         qid    = st.session_state.pop("_pending_query_id", None)
         sim    = st.session_state.pop("_pending_similarity", 0.0)
+        usage  = st.session_state.pop("_pending_token_usage", None)
+
+        if usage:
+            st.markdown(
+                f"<div style='font-size:0.75rem;color:var(--text-mute);margin-bottom:8px;'>"
+                f"⚡ Tokens: <b>{usage.get('total_tokens', 0)}</b> "
+                f"(Prompt: {usage.get('prompt_tokens', 0)} | "
+                f"Completion: {usage.get('completion_tokens', 0)})</div>",
+                unsafe_allow_html=True,
+            )
 
         # Copy button — safe: content stored in hidden span, not inlined in JS
         import html as _html
@@ -919,6 +941,7 @@ if user_input:
         "similarity": sim,
         "query_id": qid,
         "ts":       ts_now,
+        "token_usage": usage,
     })
 
     # Follow-up suggestions
