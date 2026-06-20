@@ -151,6 +151,8 @@ _defaults: dict = {
     "use_hyde":      False,
     "use_rerank":    True,
     "active_collection": "",
+    "strategy":      "hybrid",
+    "persona":       "standard",
 }
 
 # Determine the active session ID from query params
@@ -175,6 +177,8 @@ for k, v in _defaults.items():
 theme_vars = DARK_CSS if st.session_state.dark_mode else LIGHT_CSS
 st.markdown(f"<style>{theme_vars}{SHARED_CSS}</style>", unsafe_allow_html=True)
 
+
+
 st.markdown("""<script>
 function copyFromElement(btnEl) {
     var id  = btnEl.getAttribute('data-copy-id');
@@ -197,6 +201,16 @@ function copyFromElement(btnEl) {
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
+
+def check_backend_health() -> dict:
+    try:
+        r = requests.get(f"{API_BASE_URL.replace('/api', '')}/health", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {"status": "offline", "dependencies": {}}
+
 
 def load_documents() -> list:
     try:
@@ -327,6 +341,114 @@ def list_users() -> list:
         return []
 
 
+def check_login(username, password) -> dict | None:
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/queries/auth/login",
+            json={"username": username, "password": password},
+            timeout=TIMEOUT
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def register_user(username, password) -> dict | None:
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/queries/auth/register",
+            json={"username": username, "password": password},
+            timeout=TIMEOUT
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def get_admin_metrics() -> dict:
+    try:
+        r = requests.get(f"{API_BASE_URL}/queries/admin/metrics", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[DEBUG] Failed to load admin metrics: {e}")
+    return {}
+
+
+def clear_db_history() -> bool:
+    try:
+        r = requests.post(f"{API_BASE_URL}/queries/admin/clear-history", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return True
+    except Exception as e:
+        print(f"[DEBUG] Failed to clear database history: {e}")
+    return False
+
+
+def render_admin_telemetry_ui():
+    col_title, col_action = st.columns([3, 1])
+    with col_title:
+        st.markdown("### 📊 Admin Telemetry & Metrics Console")
+        st.caption("Monitoring real-time API load, database writes, and OCR performance")
+    with col_action:
+        st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+        if st.button("🗑️ Purge DB", use_container_width=True, type="primary"):
+            confirm_clear_history_modal()
+    
+    metrics = get_admin_metrics()
+    if not metrics:
+        st.info("No metrics logged yet. Try querying or uploading documents.")
+        return
+        
+    st.divider()
+    
+    # 1. Top row metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("TPM (Tokens/Min)", f"⚡ {metrics.get('tpm', 0)}")
+    c2.metric("RPM (Reqs/Min)", f"🔄 {metrics.get('rpm', 0)}")
+    
+    ocr_success = metrics.get("ocr_success", 0)
+    ocr_failure = metrics.get("ocr_failure", 0)
+    ocr_total = ocr_success + ocr_failure
+    ocr_rate = f"{(ocr_success / ocr_total * 100):.1f}%" if ocr_total > 0 else "N/A"
+    c3.metric("OCR Success Rate", ocr_rate, f"👍 {ocr_success} / 👎 {ocr_failure}")
+    
+    embed_success = metrics.get("embed_success", 0)
+    embed_failure = metrics.get("embed_failure", 0)
+    embed_total = embed_success + embed_failure
+    embed_rate = f"{(embed_success / embed_total * 100):.1f}%" if embed_total > 0 else "N/A"
+    c4.metric("Embedding Rate", embed_rate, f"👍 {embed_success} / 👎 {embed_failure}")
+    
+    st.divider()
+    
+    # 2. Charts comparison
+    st.markdown("#### 📈 Operations Summary")
+    import pandas as pd
+    chart_data = pd.DataFrame({
+        "Success": [ocr_success, embed_success],
+        "Failure": [ocr_failure, embed_failure]
+    }, index=["OCR PDF/Img", "Embedding runs"])
+    st.bar_chart(chart_data)
+    
+    st.divider()
+    
+    # 3. System Metrics Logs table
+    st.markdown("#### 📜 Telemetry Log Traces (Last 100)")
+    logs_data = metrics.get("logs", [])
+    if logs_data:
+        df_logs = pd.DataFrame(logs_data)
+        # Reorder and rename columns for readability
+        df_logs = df_logs[["created_at", "event_type", "username", "tokens", "latency", "details"]]
+        df_logs.columns = ["Timestamp", "Event Type", "User", "Tokens", "Latency (s)", "Details"]
+        st.dataframe(df_logs, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No log traces captured yet.")
+
+
 # Trigger restoration if needed on startup
 if st.session_state.get("_needs_restore"):
     st.session_state["_needs_restore"] = False
@@ -384,10 +506,21 @@ def submit_star(query_id: int, starred: bool):
 
 
 def stream_question(question: str, top_k: int, temperature: float, max_tokens: int):
+    # Apply persona instructions to the query sent to LLM
+    style_suffix = ""
+    persona = st.session_state.get("persona", "standard")
+    if persona == "academic":
+        style_suffix = "\n\nFormat your response as an objective, academic-style analysis with complete context and rigorous citations."
+    elif persona == "brief":
+        style_suffix = "\n\nFormat your response as a concise executive brief highlighting key bullet points."
+    elif persona == "coder":
+        style_suffix = "\n\nProvide technical, precise details, including code blocks where appropriate."
+
     payload = {
-        "question":    question,
+        "question":    question + style_suffix,
         "user_id":     st.session_state.user_id,
         "top_k":       top_k,
+        "strategy":    st.session_state.get("strategy", "hybrid"),
         "temperature": temperature,
         "max_tokens":  max_tokens,
         "doc_mode":    st.session_state.doc_mode,
@@ -537,17 +670,48 @@ def render_welcome():
     st.markdown(
         """<div class="welcome-card">
             <h2>👋 Welcome to RAG AI Chat</h2>
-            <p>Upload a document with <b>＋</b>, then ask anything about it.<br>
-            Answers stream in real time with sources shown.</p>
+            <p>Upload a document using <b>＋</b> in the input row, then ask questions about it.<br>
+            Configure your retrieval settings and assistant persona in the <b>⚙️ Settings</b> expander.</p>
         </div>""",
         unsafe_allow_html=True,
     )
-    st.markdown("#### 💡 Try asking:")
+    st.markdown("#### 💡 Try one of these example prompts:")
+    
+    EXAMPLE_CARDS = [
+        {
+            "category": "📝 Summarization",
+            "desc": "Condense and extract key takeaways.",
+            "question": "Summarize the key points of this document."
+        },
+        {
+            "category": "❓ Direct QA",
+            "desc": "Find answers to specific queries.",
+            "question": "What is the main topic covered?"
+        },
+        {
+            "category": "🔍 Fact Extraction",
+            "desc": "Locate specific data points and facts.",
+            "question": "What are the most important facts mentioned?"
+        },
+        {
+            "category": "📊 Quantitative Analysis",
+            "desc": "Identify numbers, dates, and metrics.",
+            "question": "Are there any numbers, dates, or statistics?"
+        }
+    ]
+
     cols = st.columns(2)
-    for i, q in enumerate(EXAMPLE_QUESTIONS):
+    for i, card in enumerate(EXAMPLE_CARDS):
         with cols[i % 2]:
-            if st.button(q, key=f"ex_{i}", use_container_width=True):
-                st.session_state["_prefill"] = q.split("  ", 1)[-1].strip()
+            st.markdown(
+                f"""<div style='background:var(--panel2); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:8px;'>
+                    <h4 style='color:var(--accent2); margin:0 0 4px 0; font-size:1.0rem;'>{card["category"]}</h4>
+                    <p style='color:var(--text-dim); font-size:0.8rem; margin:0 0 12px 0; min-height:32px;'>{card["desc"]}</p>
+                </div>""",
+                unsafe_allow_html=True
+            )
+            if st.button(f"👉 Use Prompt", key=f"ex_{i}", use_container_width=True):
+                st.session_state["_prefill"] = card["question"]
                 st.rerun()
 
 
@@ -669,15 +833,147 @@ def upload_modal():
 
 
 # ---------------------------------------------------------------------------
+# Database Maintenance modal
+# ---------------------------------------------------------------------------
+@st.dialog("⚠️ Confirm Database Purge")
+def confirm_clear_history_modal():
+    st.markdown(
+        "<div style='margin-bottom:16px;line-height:1.6;color:var(--text-dim);'>"
+        "Are you sure you want to <b>permanently delete all query histories, chat sessions, and telemetry logs</b> from the database?"
+        "<br><br><span style='color:var(--error);font-weight:bold;'>⚠️ This action is irreversible.</span>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+    
+    col_yes, col_no = st.columns(2)
+    with col_yes:
+        if st.button("🔴 Yes, Purge Database", use_container_width=True, type="primary"):
+            if clear_db_history():
+                st.session_state.messages = []
+                st.session_state.suggestions = []
+                st.toast("Database purged successfully!", icon="🗑️")
+                st.rerun()
+            else:
+                st.error("Failed to clear database history.")
+    with col_no:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+
+
+# ── Login Page ───────────────────────────────────────────────────────────
+if not st.session_state.get("logged_in"):
+    _, col_login, _ = st.columns([1, 2, 1])
+    with col_login:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown(
+            """<div style='text-align:center; margin-bottom:20px;'>
+                <h1 style='color:var(--accent); font-size:2.2rem; letter-spacing: -1px;'>🔐 RAG AI Console</h1>
+                <p style='color:var(--text-mute);'>Enter your credentials to access the workspace</p>
+            </div>""",
+            unsafe_allow_html=True
+        )
+        
+        login_tab, register_tab = st.tabs(["🔑 Sign In", "📝 Create Account"])
+        
+        with login_tab:
+            l_username = st.text_input("Username", key="login_username")
+            l_password = st.text_input("Password", type="password", key="login_password")
+            if st.button("Sign In", use_container_width=True, key="login_btn"):
+                if not l_username or not l_password:
+                    st.error("Please fill in all fields")
+                else:
+                    auth = check_login(l_username.strip(), l_password)
+                    if auth:
+                        st.session_state.logged_in = True
+                        st.session_state.username = auth["username"]
+                        st.session_state.role = auth["role"]
+                        st.session_state.user_id = auth["username"]
+                        st.query_params["session_id"] = auth["username"]
+                        st.toast(f"Welcome back, {auth['username']}!", icon="👋")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password")
+                        
+        with register_tab:
+            r_username = st.text_input("New Username", key="reg_username")
+            r_password = st.text_input("New Password", type="password", key="reg_password")
+            if st.button("Sign Up", use_container_width=True, key="reg_btn"):
+                if not r_username or not r_password:
+                    st.error("Please fill in all fields")
+                else:
+                    reg = register_user(r_username.strip(), r_password)
+                    if reg:
+                        st.session_state.logged_in = True
+                        st.session_state.username = r_username.strip()
+                        st.session_state.role = "user"
+                        st.session_state.user_id = r_username.strip()
+                        st.query_params["session_id"] = r_username.strip()
+                        st.toast(f"Welcome, {r_username.strip()}! Account created successfully.", icon="👋")
+                        st.rerun()
+                    else:
+                        st.error("Registration failed. Username may already exist.")
+                        
+    st.stop()
+
+# ── Session Resolution & Enforce Ownership ──────────────────────────────
+if st.session_state.get("logged_in"):
+    username = st.session_state.username
+    current_q_session = st.query_params.get("session_id")
+    
+    # Force query param to match account session namespace username_UUID
+    if not current_q_session or not current_q_session.startswith(username + "_"):
+        all_sessions = list_users()
+        user_sessions = [s["id"] for s in all_sessions if s["id"].startswith(username + "_")]
+        
+        if user_sessions:
+            active_session = user_sessions[0]
+            print(f"[DEBUG] Re-injecting last session for {username}: {active_session}")
+        else:
+            active_session = f"{username}_{uuid.uuid4()}"
+            print(f"[DEBUG] Generating first session for {username}: {active_session}")
+            
+        st.session_state.user_id = active_session
+        st.query_params["session_id"] = active_session
+        st.session_state["_needs_restore"] = True
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
+
+    # ── User Profile & Logout ──────────────────────────────────────────
+    st.markdown(f"**👤 Account Info**")
+    role_badge = "👑 Admin" if st.session_state.role == "admin" else "👤 User"
+    st.markdown(
+        f"""<div style='background:var(--panel2); padding:8px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; font-size:0.8rem;'>
+        <strong>User</strong>: {st.session_state.username}<br>
+        <strong>Role</strong>: {role_badge}
+        </div>""",
+        unsafe_allow_html=True
+    )
+    
+    # Console View Selector for Admin
+    if st.session_state.role == "admin":
+        st.radio("Console View", ["💬 Chat Sandbox", "📊 Telemetry Dashboard"], key="admin_view_selector")
+        st.divider()
+        
+    if st.button("🚪 Log Out", use_container_width=True, key="logout_btn"):
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.session_state.role = ""
+        st.session_state.messages = []
+        st.session_state.documents = []
+        st.query_params.clear()
+        st.rerun()
+
+    st.divider()
 
     st.markdown('<div class="new-chat-btn">', unsafe_allow_html=True)
     if st.button("＋  New Chat", use_container_width=True, key="new_chat"):
         for k, v in _defaults.items():
             st.session_state[k] = v
-        new_id = str(uuid.uuid4())
+        # User-isolated session ID
+        new_id = f"{st.session_state.username}_{uuid.uuid4()}"
         st.session_state.user_id = new_id
         st.query_params["session_id"] = new_id
         print(f"[DEBUG] Starting a new chat session: {new_id}")
@@ -686,19 +982,25 @@ with st.sidebar:
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("### 💬 RAG AI Chat")
-    st.caption("Active Session ID:")
-    st.code(st.session_state.user_id, language="text")
+    if st.session_state.role == "admin":
+        st.caption("Active Session ID:")
+        st.code(st.session_state.user_id, language="text")
     st.divider()
 
     # ── Load Past Sessions ──────────────────────────────────────────
     sessions = list_users()
     if sessions:
-        session_opts = {s["id"]: f"📂 {s['id'][:8]}… ({s['created_at'][5:16].replace('T', ' ')})" for s in sessions}
+        # Filter sessions for regular users to only show their own
+        if st.session_state.role != "admin":
+            username_prefix = st.session_state.username + "_"
+            sessions = [s for s in sessions if s["id"].startswith(username_prefix)]
+            
+        session_opts = {s["id"]: f"📂 {s['id'].split('_')[-1][:8] if '_' in s['id'] else s['id'][:8]}… ({s['created_at'][5:16].replace('T', ' ')})" for s in sessions}
         current_id = st.session_state.user_id
         options_list = list(session_opts.keys())
         
         if current_id not in session_opts:
-            session_opts[current_id] = f"✨ Current Session ({current_id[:8]}…)"
+            session_opts[current_id] = f"✨ Current Session ({current_id.split('_')[-1][:8] if '_' in current_id else current_id[:8]}…)"
             options_list = [current_id] + options_list
             
         selected_session = st.selectbox(
@@ -791,56 +1093,104 @@ with st.sidebar:
 
     # ── Settings ────────────────────────────────────────────────────
     with st.expander("⚙️ Settings", expanded=False):
-        import os
-        default_top_k = int(os.getenv("TOP_K", 3))
-        top_k       = st.slider("Chunks to retrieve",    1, 12, default_top_k)
-        temperature = st.slider("Creativity",            0.0, 1.0, 0.1, step=0.05)
-        max_tokens  = st.slider("Max response length",   256, 4096, 2048, step=256)
+        if st.session_state.role == "admin":
+            # Retrieval Strategy
+            strategies = ["hybrid", "advanced", "basic"]
+            st.session_state.strategy = st.selectbox(
+                "🧠 Retrieval Strategy",
+                options=strategies,
+                index=strategies.index(st.session_state.get("strategy", "hybrid")),
+                format_func=lambda x: {
+                    "basic": "🔍 Basic (Pure Vector)",
+                    "hybrid": "🔀 Hybrid (Vector + Keyword + TF-IDF Rerank)",
+                    "advanced": "🚀 Advanced (Multi-Query + RRF + MMR + Cross-Encoder)"
+                }.get(x, x),
+                help="Choose the algorithm to fetch documents. Advanced offers semantic query expansion and diversification."
+            )
 
-        st.divider()
+            # Assistant Persona
+            personas = ["standard", "academic", "brief", "coder"]
+            st.session_state.persona = st.selectbox(
+                "🎭 Assistant Persona",
+                options=personas,
+                index=personas.index(st.session_state.get("persona", "standard")),
+                format_func=lambda x: {
+                    "standard": "💬 Standard Assistant",
+                    "academic": "🎓 Academic Researcher (Citations & Detail)",
+                    "brief": "💼 Executive Brief (Key Bullet Points)",
+                    "coder": "💻 Software Engineer (Technical & Precise)"
+                }.get(x, x),
+                help="Instructs the AI on formatting and styling the generated response."
+            )
 
-        # Document mode toggle
-        st.session_state.doc_mode = st.toggle(
-            "📄 Document mode",
-            value=st.session_state.doc_mode,
-            help="ON = answer from your documents only. OFF = general LLM mode.",
-        )
+            st.divider()
 
-        # HyDE
-        st.session_state.use_hyde = st.toggle(
-            "🧠 HyDE query expansion",
-            value=st.session_state.use_hyde,
-            help="Expand query to hypothetical answer before embedding (improves recall for vague questions)",
-        )
+            import os
+            default_top_k = int(os.getenv("TOP_K", 3))
+            top_k       = st.slider("Chunks to retrieve",    1, 12, default_top_k)
+            temperature = st.slider("Creativity",            0.0, 1.0, 0.1, step=0.05)
+            max_tokens  = st.slider("Max response length",   256, 4096, 2048, step=256)
 
-        # Re-rank
-        st.session_state.use_rerank = st.toggle(
-            "🔁 TF-IDF re-ranking",
-            value=st.session_state.use_rerank,
-            help="Re-score retrieved chunks by lexical overlap (combines with vector score)",
-        )
+            st.divider()
 
-        st.divider()
+            # Document mode toggle
+            st.session_state.doc_mode = st.toggle(
+                "📄 Document mode",
+                value=st.session_state.doc_mode,
+                help="ON = answer from your documents only. OFF = general LLM mode.",
+            )
 
-        # Restore Session manually
-        manual_session = st.text_input(
-            "🔑 Restore Session ID",
-            value=st.session_state.user_id,
-            help="Enter a valid Session UUID to reload its history and documents.",
-        )
-        if manual_session and manual_session.strip() != st.session_state.user_id:
-            try:
-                val_uuid = uuid.UUID(manual_session.strip())
-                st.session_state.user_id = str(val_uuid)
-                st.query_params["session_id"] = str(val_uuid)
-                print(f"[DEBUG] Restoring session manually to: {val_uuid}")
-                restore_session_chat(str(val_uuid))
-                load_documents()
-                st.rerun()
-            except ValueError:
-                st.error("Invalid UUID format. Please check the session key.")
+            # HyDE
+            st.session_state.use_hyde = st.toggle(
+                "🧠 HyDE query expansion",
+                value=st.session_state.use_hyde,
+                help="Expand query to hypothetical answer before embedding (improves recall for vague questions)",
+            )
 
-        st.divider()
+            # Re-rank
+            st.session_state.use_rerank = st.toggle(
+                "🔁 TF-IDF re-ranking",
+                value=st.session_state.use_rerank,
+                help="Re-score retrieved chunks by lexical overlap (combines with vector score)",
+            )
+
+            st.divider()
+
+            # Restore Session manually
+            manual_session = st.text_input(
+                "🔑 Restore Session ID",
+                value=st.session_state.user_id,
+                help="Enter a valid Session UUID to reload its history and documents.",
+            )
+            if manual_session and manual_session.strip() != st.session_state.user_id:
+                try:
+                    val_uuid = uuid.UUID(manual_session.strip())
+                    st.session_state.user_id = str(val_uuid)
+                    st.query_params["session_id"] = str(val_uuid)
+                    print(f"[DEBUG] Restoring session manually to: {val_uuid}")
+                    restore_session_chat(str(val_uuid))
+                    load_documents()
+                    st.rerun()
+                except ValueError:
+                    st.error("Invalid UUID format. Please check the session key.")
+
+            st.divider()
+        else:
+            st.session_state.strategy = "hybrid"
+            st.session_state.persona = "standard"
+            import os
+            top_k = int(os.getenv("TOP_K", 3))
+            temperature = 0.1
+            max_tokens = 2048
+            st.session_state.use_hyde = False
+            st.session_state.use_rerank = True
+
+            st.session_state.doc_mode = st.toggle(
+                "📄 Document mode",
+                value=st.session_state.doc_mode,
+                help="ON = answer from your documents only. OFF = general LLM mode.",
+            )
+            st.divider()
 
         mode_label = "☀️ Light mode" if st.session_state.dark_mode else "🌙 Dark mode"
         if st.button(mode_label, use_container_width=True):
@@ -872,22 +1222,70 @@ with st.sidebar:
             use_container_width=True,
         )
 
-    # ── Session stats ────────────────────────────────────────────────
-    if st.session_state.messages:
-        st.divider()
-        q_cnt  = sum(1 for m in st.session_state.messages if m["role"] == "user")
-        fb_pos = sum(1 for v in st.session_state.feedback.values() if v == 1)
-        fb_neg = sum(1 for v in st.session_state.feedback.values() if v == -1)
-        c1, c2 = st.columns(2)
-        c1.metric("Queries", q_cnt)
-        c2.metric("Docs",    doc_count)
-        if fb_pos or fb_neg:
-            st.caption(f"Feedback: 👍 {fb_pos}  👎 {fb_neg}")
+    st.divider()
+    
+    # ── System Health Checker ─────────────────────────────────────────
+    st.markdown("**🖥️ System Status**")
+    health = check_backend_health()
+    if health.get("status") in ("healthy", "ok", "degraded"):
+        status_text = "🟢 Online" if health.get("status") == "healthy" else "🟡 Degraded"
+        postgres_status = "🟢 Postgres" if health.get("dependencies", {}).get("postgres") == "ok" else "🔴 Postgres"
+        ollama_status = "🟢 Ollama" if health.get("dependencies", {}).get("ollama") == "ok" else "🔴 Ollama"
+    else:
+        status_text = "🔴 Offline"
+        postgres_status = "⚪ Postgres"
+        ollama_status = "⚪ Ollama"
+        
+    st.markdown(
+        f"""<div style='font-size:0.75rem; background:var(--panel2); padding:10px; border:1px solid var(--border); border-radius:8px; line-height: 1.45;'>
+        <strong>API Server</strong>: {status_text}<br>
+        <strong>Database</strong>: {postgres_status} &nbsp;|&nbsp; <strong>Ollama</strong>: {ollama_status}
+        </div>""",
+        unsafe_allow_html=True
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Diagnostics & Stats ──────────────────────────────────────────
+    st.markdown("**📊 Diagnostic Console**")
+    total_chunks = sum(doc.get("chunks", 0) for doc in docs)
+    q_cnt  = sum(1 for m in st.session_state.messages if m["role"] == "user")
+    
+    st.markdown(
+        f"""<div style='display:grid; grid-template-columns: repeat(2, 1fr); gap:8px;'>
+            <div style='background:var(--panel2); padding:8px; border:1px solid var(--border); border-radius:8px; text-align:center;'>
+                <div style='font-size:0.65rem; color:var(--text-mute); text-transform: uppercase;'>Total Chunks</div>
+                <div style='font-size:1.0rem; font-weight:bold; color:var(--accent2);'>{total_chunks}</div>
+            </div>
+            <div style='background:var(--panel2); padding:8px; border:1px solid var(--border); border-radius:8px; text-align:center;'>
+                <div style='font-size:0.65rem; color:var(--text-mute); text-transform: uppercase;'>User Queries</div>
+                <div style='font-size:1.0rem; font-weight:bold; color:var(--accent2);'>{q_cnt}</div>
+            </div>
+            <div style='background:var(--panel2); padding:8px; border:1px solid var(--border); border-radius:8px; text-align:center;'>
+                <div style='font-size:0.65rem; color:var(--text-mute); text-transform: uppercase;'>Strategy</div>
+                <div style='font-size:0.9rem; font-weight:bold; color:var(--accent2);'>{st.session_state.get('strategy', 'hybrid').capitalize()}</div>
+            </div>
+            <div style='background:var(--panel2); padding:8px; border:1px solid var(--border); border-radius:8px; text-align:center;'>
+                <div style='font-size:0.65rem; color:var(--text-mute); text-transform: uppercase;'>Persona</div>
+                <div style='font-size:0.9rem; font-weight:bold; color:var(--accent2);'>{st.session_state.get('persona', 'standard').capitalize()}</div>
+            </div>
+        </div>""",
+        unsafe_allow_html=True
+    )
+    
+    fb_pos = sum(1 for v in st.session_state.feedback.values() if v == 1)
+    fb_neg = sum(1 for v in st.session_state.feedback.values() if v == -1)
+    if fb_pos or fb_neg:
+        st.caption(f"Feedback logs: 👍 {fb_pos} &nbsp; 👎 {fb_neg}")
 
 
 # ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
+if st.session_state.role == "admin" and st.session_state.get("admin_view_selector") == "📊 Telemetry Dashboard":
+    render_admin_telemetry_ui()
+    st.stop()
+
 st.markdown(
     "<h1 style='margin-bottom:2px'>💬 RAG AI Chat</h1>"
     "<p style='color:var(--text-mute);margin-top:0;margin-bottom:16px;font-size:.95rem'>"

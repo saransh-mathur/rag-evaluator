@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from db.connection import get_db
-from db.models import DocumentChunk, QueryHistory, User
+from db.models import DocumentChunk, QueryHistory, User, UserAccount
 from services.generation import (
     generate_answer,
     generate_answer_stream,
@@ -223,6 +223,7 @@ def _ensure_user(db: Session, user_id: str) -> None:
 @router.post("/ask", response_model=QueryResponse)
 async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
     """Blocking question endpoint."""
+    start_time = time.time()
     try:
         _check_rate_limit(req.user_id)
         _ensure_user(db, req.user_id)
@@ -260,6 +261,19 @@ async def ask_question(req: QueryRequest, db: Session = Depends(get_db)):
         db.refresh(history)
 
         print(f"[DEBUG] Query stored successfully. Usage metrics: {usage}")
+
+        # Record query metrics in telemetry
+        from db.models import SystemMetric
+        latency = time.time() - start_time
+        total_tokens = usage.get("total_tokens", 0) if usage else 0
+        db.add(SystemMetric(
+            event_type="query",
+            username=req.user_id,
+            tokens=total_tokens,
+            latency=latency,
+            details=req.question[:200]
+        ))
+        db.commit()
 
         return QueryResponse(
             question=req.question,
@@ -307,6 +321,7 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
         return StreamingResponse(rate_error(), media_type="text/event-stream")
 
     def event_stream() -> Iterator[str]:
+        start_time = time.time()
         try:
             _ensure_user(db, req.user_id)
 
@@ -367,6 +382,18 @@ async def ask_question_stream(req: QueryRequest, db: Session = Depends(get_db)):
                 "total_tokens": total_tokens
             }
             print(f"[DEBUG] Streaming complete. Usage: {usage_dict}")
+
+            # Record query metrics in telemetry
+            from db.models import SystemMetric
+            latency = time.time() - start_time
+            db.add(SystemMetric(
+                event_type="query",
+                username=req.user_id,
+                tokens=total_tokens,
+                latency=latency,
+                details=req.question[:200]
+            ))
+            db.commit()
 
             yield _sse({
                 "type": "done",
@@ -578,3 +605,115 @@ async def autocomplete(
         .all()
     ]
     return {"suggestions": generate_search_autocomplete(q, past)}
+
+
+# ---------------------------------------------------------------------------
+# Auth & Telemetry / Admin Metrics
+# ---------------------------------------------------------------------------
+from datetime import timedelta
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/auth/login")
+async def login(req: LoginRequest, db: Session = Depends(get_db)):
+    """Authenticate UserAccount and return user info."""
+    import hashlib
+    user = db.query(UserAccount).filter(UserAccount.username == req.username).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+    pwd_hash = hashlib.sha256(req.password.encode()).hexdigest()
+    if pwd_hash != user.password_hash:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+    return {
+        "status": "ok",
+        "username": user.username,
+        "role": user.role
+    }
+
+
+@router.post("/auth/register")
+async def register(req: LoginRequest, db: Session = Depends(get_db)):
+    """Register a new user account (defaults to user role)."""
+    import hashlib
+    existing = db.query(UserAccount).filter(UserAccount.username == req.username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+        
+    pwd_hash = hashlib.sha256(req.password.encode()).hexdigest()
+    new_user = UserAccount(username=req.username, password_hash=pwd_hash, role="user")
+    db.add(new_user)
+    db.commit()
+    return {"status": "ok", "message": "User registered successfully"}
+
+
+@router.get("/admin/metrics")
+async def get_admin_metrics(db: Session = Depends(get_db)):
+    """Fetch administrative analytics (TPM, RPM, OCR metrics)."""
+    from db.models import SystemMetric
+    
+    one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
+    
+    # 1. RPM (Queries in last minute)
+    rpm = db.query(SystemMetric).filter(
+        SystemMetric.event_type == "query",
+        SystemMetric.created_at >= one_minute_ago
+    ).count()
+    
+    # 2. TPM (Sum of tokens in last minute)
+    tpm_query = db.query(SystemMetric.tokens).filter(
+        SystemMetric.event_type == "query",
+        SystemMetric.created_at >= one_minute_ago
+    ).all()
+    tpm = sum(t[0] for t in tpm_query if t[0] is not None)
+    
+    # 3. OCR success / failure count
+    ocr_success = db.query(SystemMetric).filter(SystemMetric.event_type == "ocr_success").count()
+    ocr_failure = db.query(SystemMetric).filter(SystemMetric.event_type == "ocr_failure").count()
+    
+    # 4. Embedding success / failure count
+    embed_success = db.query(SystemMetric).filter(SystemMetric.event_type == "embed_success").count()
+    embed_failure = db.query(SystemMetric).filter(SystemMetric.event_type == "embed_failure").count()
+    
+    # 5. Retrieve last 100 log items
+    logs = db.query(SystemMetric).order_by(SystemMetric.created_at.desc()).limit(100).all()
+    log_list = [
+        {
+            "id": l.id,
+            "event_type": l.event_type,
+            "username": l.username,
+            "tokens": l.tokens,
+            "latency": round(l.latency, 3) if l.latency else 0.0,
+            "details": l.details,
+            "created_at": l.created_at.isoformat()
+        }
+        for l in logs
+    ]
+    
+    return {
+        "rpm": rpm,
+        "tpm": tpm,
+        "ocr_success": ocr_success,
+        "ocr_failure": ocr_failure,
+        "embed_success": embed_success,
+        "embed_failure": embed_failure,
+        "logs": log_list
+    }
+
+
+@router.post("/admin/clear-history")
+async def clear_history(db: Session = Depends(get_db)):
+    """Clear all chat history and telemetry logs from the database."""
+    try:
+        db.query(QueryHistory).delete()
+        from db.models import SystemMetric
+        db.query(SystemMetric).delete()
+        db.commit()
+        return {"status": "ok", "message": "All chat history and system metrics have been cleared successfully."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database purge failed: {str(e)}")

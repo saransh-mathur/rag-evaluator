@@ -34,9 +34,30 @@ def get_db() -> Session:
 
 
 def init_db():
-    """Initialize database tables."""
-    from .models import Base
+    """Initialize database tables and seed default accounts."""
+    from .models import Base, UserAccount
     Base.metadata.create_all(bind=engine)
+    
+    import hashlib
+    db = SessionLocal()
+    try:
+        # Seed admin
+        admin = db.query(UserAccount).filter(UserAccount.username == "admin").first()
+        if not admin:
+            admin_pwd_hash = hashlib.sha256("admin123".encode()).hexdigest()
+            db.add(UserAccount(username="admin", password_hash=admin_pwd_hash, role="admin"))
+            
+        # Seed user
+        user = db.query(UserAccount).filter(UserAccount.username == "user").first()
+        if not user:
+            user_pwd_hash = hashlib.sha256("user123".encode()).hexdigest()
+            db.add(UserAccount(username="user", password_hash=user_pwd_hash, role="user"))
+            
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 @contextmanager

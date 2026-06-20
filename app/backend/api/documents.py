@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 # Helpers
 # ---------------------------------------------------------------------------
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+def extract_text_from_pdf(pdf_bytes: bytes, filename: str = "", username: str = "") -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     parts = [page.extract_text() or "" for page in reader.pages]
     text = clean_text("\n\n".join(p for p in parts if p))
@@ -47,11 +47,21 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             )
 
         if not has_tesseract:
+            # Log failure
+            from db.connection import get_db_context
+            from db.models import SystemMetric
+            with get_db_context() as db:
+                db.add(SystemMetric(event_type="ocr_failure", username=username, details=f"Scanned PDF: {filename}, Error: Tesseract binary missing"))
             raise RuntimeError(
                 "Scanned PDF detected, but Tesseract OCR engine is not installed on the system. "
                 "Please run: sudo apt install tesseract-ocr"
             )
         if not has_poppler:
+            # Log failure
+            from db.connection import get_db_context
+            from db.models import SystemMetric
+            with get_db_context() as db:
+                db.add(SystemMetric(event_type="ocr_failure", username=username, details=f"Scanned PDF: {filename}, Error: Poppler pdftoppm missing"))
             raise RuntimeError(
                 "Scanned PDF detected, but Poppler utilities (pdftoppm) are not installed on the system. "
                 "Please run: sudo apt install poppler-utils"
@@ -62,14 +72,25 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             images = convert_from_bytes(pdf_bytes)
             ocr_parts = [pytesseract.image_to_string(img) for img in images]
             text = clean_text("\n\n".join(p for p in ocr_parts if p))
+            
+            # Log success
+            from db.connection import get_db_context
+            from db.models import SystemMetric
+            with get_db_context() as db:
+                db.add(SystemMetric(event_type="ocr_success", username=username, details=f"Scanned PDF: {filename}"))
         except Exception as e:
             logger.warning(f"OCR failed for PDF: {e}")
+            # Log failure
+            from db.connection import get_db_context
+            from db.models import SystemMetric
+            with get_db_context() as db:
+                db.add(SystemMetric(event_type="ocr_failure", username=username, details=f"Scanned PDF: {filename}, Error: {str(e)}"))
             raise RuntimeError(f"OCR processing failed: {e}")
             
     return text
 
 
-def extract_text_from_image(img_bytes: bytes) -> str:
+def extract_text_from_image(img_bytes: bytes, filename: str = "", username: str = "") -> str:
     import shutil
     has_tesseract = shutil.which("tesseract") is not None
 
@@ -80,14 +101,35 @@ def extract_text_from_image(img_bytes: bytes) -> str:
         raise RuntimeError("OCR Python dependencies are missing. Run: pip install pytesseract Pillow")
 
     if not has_tesseract:
+        # Log failure
+        from db.connection import get_db_context
+        from db.models import SystemMetric
+        with get_db_context() as db:
+            db.add(SystemMetric(event_type="ocr_failure", username=username, details=f"Image: {filename}, Error: Tesseract binary missing"))
         raise RuntimeError(
             "Image uploaded, but Tesseract OCR engine is not installed on the system. "
             "Please run: sudo apt install tesseract-ocr"
         )
 
-    img = Image.open(io.BytesIO(img_bytes))
-    text = pytesseract.image_to_string(img)
-    return clean_text(text)
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img)
+        cleaned = clean_text(text)
+        
+        # Log success
+        from db.connection import get_db_context
+        from db.models import SystemMetric
+        with get_db_context() as db:
+            db.add(SystemMetric(event_type="ocr_success", username=username, details=f"Image: {filename}"))
+            
+        return cleaned
+    except Exception as e:
+        # Log failure
+        from db.connection import get_db_context
+        from db.models import SystemMetric
+        with get_db_context() as db:
+            db.add(SystemMetric(event_type="ocr_failure", username=username, details=f"Image: {filename}, Error: {str(e)}"))
+        raise RuntimeError(f"Image OCR failed: {e}")
 
 
 def _generate_summary_bg(document_id: int, text: str, filename: str) -> None:
@@ -142,9 +184,9 @@ async def upload_document(
         filename_lower = (file.filename or "").lower()
 
         if filename_lower.endswith(".pdf") or file.content_type == "application/pdf":
-            text = extract_text_from_pdf(content)
+            text = extract_text_from_pdf(content, filename=file.filename, username=user_id)
         elif filename_lower.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp")) or (file.content_type and file.content_type.startswith("image/")):
-            text = extract_text_from_image(content)
+            text = extract_text_from_image(content, filename=file.filename, username=user_id)
         else:
             try:
                 text = content.decode("utf-8")
@@ -169,15 +211,34 @@ async def upload_document(
 
         db_chunks = []
         for idx, chunk_str in enumerate(chunks):
-            embedding = embed_text(chunk_str)
-            db_chunk = DocumentChunk(
-                document_id=doc.id,
-                text=chunk_str,
-                embedding=embedding,
-                chunk_index=idx,
-            )
-            db.add(db_chunk)
-            db_chunks.append(db_chunk)
+            try:
+                embedding = embed_text(chunk_str)
+                db_chunk = DocumentChunk(
+                    document_id=doc.id,
+                    text=chunk_str,
+                    embedding=embedding,
+                    chunk_index=idx,
+                )
+                db.add(db_chunk)
+                db_chunks.append(db_chunk)
+            except Exception as e:
+                # Log embedding failure
+                from db.models import SystemMetric
+                db.add(SystemMetric(
+                    event_type="embed_failure",
+                    username=user_id,
+                    details=f"File: {file.filename}, Error: {str(e)}"
+                ))
+                db.commit()
+                raise RuntimeError(f"Embedding generation failed: {e}")
+
+        # Log embedding success
+        from db.models import SystemMetric
+        db.add(SystemMetric(
+            event_type="embed_success",
+            username=user_id,
+            details=f"File: {file.filename}, Chunks: {len(db_chunks)}"
+        ))
 
         db.commit()
         db.refresh(doc)

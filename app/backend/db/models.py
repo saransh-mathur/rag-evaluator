@@ -67,3 +67,26 @@ class QueryHistory(Base):
     created_at           = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="queries")
+
+
+class UserAccount(Base):
+    """Admin and User accounts for login authentication."""
+    __tablename__ = "user_accounts"
+
+    username      = Column(String(100), primary_key=True)
+    password_hash = Column(String(255), nullable=False)
+    role          = Column(String(20), default="user") # "admin" or "user"
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+
+class SystemMetric(Base):
+    """Telemetry log for TPM, RPM, OCR, and embedding success/failures."""
+    __tablename__ = "system_metrics"
+
+    id         = Column(Integer, primary_key=True)
+    event_type = Column(String(50), nullable=False) # "ocr_success", "ocr_failure", "embed_success", "embed_failure", "query"
+    username   = Column(String(100), nullable=True)
+    tokens     = Column(Integer, default=0)
+    latency    = Column(Float, default=0.0)
+    details    = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
