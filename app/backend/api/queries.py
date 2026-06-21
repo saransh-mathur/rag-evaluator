@@ -221,21 +221,31 @@ def _ensure_user(db: Session, user_id: str) -> None:
 def run_background_chunk_eval(history_id: int, question: str, chunks: list[dict]):
     from db.connection import SessionLocal
     from db.models import QueryHistory
-    from services.generation import evaluate_chunks_relevance
+    from services.generation import evaluate_chunks_relevance, evaluate_rag_triad
     import json
     
-    evals = evaluate_chunks_relevance(question, chunks)
+    # Rebuild context text for RAG Triad
+    context_parts = []
+    for c in chunks:
+        context_parts.append(f"[Source: {c.get('filename', 'unknown')}]\n{c.get('text', '')}")
+    context_text = "\n\n---\n\n".join(context_parts)
     
     db = SessionLocal()
     try:
         q = db.query(QueryHistory).filter(QueryHistory.id == history_id).first()
         if q:
-            q.chunk_evaluations = json.dumps(evals)
+            chunk_evals = evaluate_chunks_relevance(question, chunks)
+            triad_evals = evaluate_rag_triad(question, q.answer, context_text)
+            combined_evals = {
+                "chunks": chunk_evals,
+                "triad": triad_evals
+            }
+            q.chunk_evaluations = json.dumps(combined_evals)
             db.commit()
-            print(f"[DEBUG] Background chunk evaluations stored for query ID {history_id}")
+            print(f"[DEBUG] Combined evaluations stored for query ID {history_id}")
     except Exception as e:
         db.rollback()
-        print(f"[DEBUG] Failed to save background chunk evaluations: {e}")
+        print(f"[DEBUG] Failed to save background evaluations: {e}")
     finally:
         db.close()
 
@@ -295,8 +305,13 @@ async def ask_question(
         db.commit()
         db.refresh(history)
 
-        # Enqueue chunk relevance evaluation in background
-        background_tasks.add_task(run_background_chunk_eval, history.id, req.question, retrieved_chunks)
+        # Enqueue chunk relevance and RAG Triad evaluation via Celery
+        try:
+            from tasks import evaluate_query_triad
+            evaluate_query_triad.delay(history.id)
+        except Exception as e:
+            print(f"[DEBUG] Failed to queue Celery evaluation: {e}, falling back to background task")
+            background_tasks.add_task(run_background_chunk_eval, history.id, req.question, retrieved_chunks)
 
         print(f"[DEBUG] Query stored successfully. Usage metrics: {usage}")
 
@@ -304,9 +319,10 @@ async def ask_question(
         from db.models import SystemMetric
         latency = time.time() - start_time
         total_tokens = usage.get("total_tokens", 0) if usage else 0
+        base_username = req.user_id.split("_")[0] if "_" in req.user_id else req.user_id
         db.add(SystemMetric(
             event_type="query",
-            username=req.user_id,
+            username=base_username,
             tokens=total_tokens,
             latency=latency,
             details=req.question[:200]
@@ -418,8 +434,13 @@ async def ask_question_stream(
             db.commit()
             db.refresh(history)
 
-            # Enqueue chunk relevance evaluation in background
-            background_tasks.add_task(run_background_chunk_eval, history.id, req.question, retrieved_chunks)
+            # Enqueue chunk relevance and RAG Triad evaluation via Celery
+            try:
+                from tasks import evaluate_query_triad
+                evaluate_query_triad.delay(history.id)
+            except Exception as e:
+                print(f"[DEBUG] Failed to queue Celery evaluation: {e}, falling back to background task")
+                background_tasks.add_task(run_background_chunk_eval, history.id, req.question, retrieved_chunks)
 
             # Estimate streaming response token usage (Step 3/4)
             from services.generation import _build_prompt
@@ -439,9 +460,10 @@ async def ask_question_stream(
             # Record query metrics in telemetry
             from db.models import SystemMetric
             latency = time.time() - start_time
+            base_username = req.user_id.split("_")[0] if "_" in req.user_id else req.user_id
             db.add(SystemMetric(
                 event_type="query",
-                username=req.user_id,
+                username=base_username,
                 tokens=total_tokens,
                 latency=latency,
                 details=req.question[:200]
@@ -665,7 +687,7 @@ async def autocomplete(
 # ---------------------------------------------------------------------------
 # Auth & Telemetry / Admin Metrics
 # ---------------------------------------------------------------------------
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 class LoginRequest(BaseModel):
     username: str
@@ -704,6 +726,18 @@ async def register(req: LoginRequest, db: Session = Depends(get_db)):
     db.add(new_user)
     db.commit()
     return {"status": "ok", "message": "User registered successfully"}
+
+
+@router.get("/auth/user-role/{username}")
+async def get_user_role(username: str, db: Session = Depends(get_db)):
+    """Fetch user account role based on username (helper for UI autologin)."""
+    user = db.query(UserAccount).filter(UserAccount.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+    return {
+        "username": user.username,
+        "role":     user.role
+    }
 
 
 @router.get("/admin/metrics")
@@ -823,6 +857,22 @@ async def get_users_report(db: Session = Depends(get_db)):
             if latencies:
                 avg_latency = round(sum(latencies) / len(latencies), 2)
                 
+            # Calculate user-specific RPM & TPM
+            one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
+            rpm = sum(1 for m in metrics if m.event_type == "query" and m.created_at >= one_minute_ago)
+            tpm = sum(m.tokens for m in metrics if m.event_type == "query" and m.tokens is not None and m.created_at >= one_minute_ago)
+            
+            # Retrieve token history for the last 50 queries
+            user_queries = [m for m in metrics if m.event_type == "query"]
+            user_queries.sort(key=lambda x: x.created_at)
+            token_history = [
+                {
+                    "created_at": q.created_at.isoformat(),
+                    "tokens": q.tokens or 0
+                }
+                for q in user_queries[-50:]
+            ]
+                
             report.append({
                 "username": acc.username,
                 "role": acc.role,
@@ -834,7 +884,10 @@ async def get_users_report(db: Session = Depends(get_db)):
                 "feedback_positive": pos_feedback,
                 "feedback_negative": neg_feedback,
                 "total_tokens": total_tokens,
-                "avg_latency": avg_latency
+                "avg_latency": avg_latency,
+                "rpm": rpm,
+                "tpm": tpm,
+                "token_history": token_history
             })
             
         return report

@@ -163,6 +163,20 @@ if "user_id" not in st.session_state:
         print(f"[DEBUG] Found session_id in query parameters: {q_session_id}")
         st.session_state.user_id = q_session_id
         st.session_state["_needs_restore"] = True
+        
+        # Check if this session_id corresponds to a registered user for autologin
+        try:
+            # Extract username prefix from session_id if structured as username_UUID
+            username = q_session_id.split("_")[0] if "_" in q_session_id else q_session_id
+            r = requests.get(f"{API_BASE_URL}/queries/auth/user-role/{username}", timeout=TIMEOUT)
+            if r.status_code == 200:
+                user_info = r.json()
+                st.session_state.logged_in = True
+                st.session_state.username = user_info["username"]
+                st.session_state.role = user_info["role"]
+                print(f"[DEBUG] Autologin successful for user: {user_info['username']} (role: {user_info['role']})")
+        except Exception as e:
+            print(f"[DEBUG] Autologin check failed: {e}")
     else:
         new_id = str(uuid.uuid4())
         print(f"[DEBUG] No session ID in query params. Generating new UUID: {new_id}")
@@ -526,6 +540,8 @@ def render_admin_telemetry_ui():
 - **Total Queries Ran**: `{u['queries_count']}`
 - **Documents Uploaded**: `{u['documents_count']}`
 - **Total Tokens Consumed**: `{u['total_tokens']:,}`
+- **RPM (Requests/Min)**: `🔄 {u.get('rpm', 0)}`
+- **TPM (Tokens/Min)**: `⚡ {u.get('tpm', 0)}`
 - **Average LLM Response Latency**: `{u['avg_latency']}s`
 - **Feedback Rating**: 👍 `{u['feedback_positive']}` / 👎 `{u['feedback_negative']}`"""
                         )
@@ -547,6 +563,19 @@ def render_admin_telemetry_ui():
                                         st.rerun()
                         else:
                             st.info("Root Admin or Currently Logged-in User (Actions Disabled)")
+                            
+                    # Token usage history graph
+                    token_history = u.get("token_history", [])
+                    if token_history:
+                        st.markdown("##### 📈 Token Consumption History (Last 50 Queries)")
+                        import pandas as pd
+                        df_tokens = pd.DataFrame(token_history)
+                        df_tokens["Timestamp"] = pd.to_datetime(df_tokens["created_at"])
+                        df_tokens = df_tokens.sort_values("Timestamp")
+                        df_tokens = df_tokens.rename(columns={"tokens": "Tokens"})
+                        st.area_chart(df_tokens.set_index("Timestamp")["Tokens"], height=160)
+                    else:
+                        st.caption("No queries run by this user yet.")
 
 
 def load_custom_instructions(username: str) -> str:
@@ -774,9 +803,14 @@ def render_sources(chunks: list, chunk_evaluations: dict = None):
                 cid = str(chunk.get("chunk_id") or chunk.get("id") or "")
                 eval_info = None
                 if chunk_evaluations:
-                    eval_info = chunk_evaluations.get(cid)
+                    # Handle backward compatibility: check if it's the combined dictionary
+                    chunks_dict = chunk_evaluations
+                    if isinstance(chunk_evaluations, dict) and "chunks" in chunk_evaluations:
+                        chunks_dict = chunk_evaluations.get("chunks") or {}
+                        
+                    eval_info = chunks_dict.get(cid)
                     if not eval_info and cid.isdigit():
-                        eval_info = chunk_evaluations.get(int(cid))
+                        eval_info = chunks_dict.get(int(cid))
                 
                 if eval_info:
                     relevance = eval_info.get("relevance", 3)
@@ -819,6 +853,40 @@ def render_sources(chunks: list, chunk_evaluations: dict = None):
                     {eval_html}
                 </div>""",
                 unsafe_allow_html=True,
+            )
+
+
+def render_rag_triad_ui(triad: dict):
+    if not triad:
+        return
+        
+    st.markdown(
+        "<div style='font-weight:600; margin-top:12px; margin-bottom:8px; color:var(--accent2); font-size:0.9rem;'>📊 RAG Triad Quality Assessment</div>",
+        unsafe_allow_html=True
+    )
+    
+    cols = st.columns(3)
+    metrics = [
+        ("faithfulness", "🟢 Groundedness"),
+        ("answer_relevance", "🎯 Answer Relevance"),
+        ("context_recall", "📚 Context Recall")
+    ]
+    
+    for idx, (key, label) in enumerate(metrics):
+        eval_info = triad.get(key, {})
+        score = eval_info.get("score", 3)
+        reason = eval_info.get("reason", "No explanation provided.")
+        
+        color = "#28a745" if score >= 4 else "#ffc107" if score >= 3 else "#dc3545"
+        
+        with cols[idx]:
+            st.markdown(
+                f"""<div style="background: var(--panel2); border: 1px solid var(--border); border-left: 4px solid {color}; border-radius: 8px; padding: 10px; min-height: 110px;">
+                    <div style="font-size:0.75rem; text-transform: uppercase; color:var(--text-mute); font-weight:600;">{label}</div>
+                    <div style="font-size:1.4rem; font-weight:bold; color:{color}; margin: 2px 0;">{score} / 5</div>
+                    <div style="font-size:0.7rem; color:var(--text-dim); line-height:1.3;">{reason}</div>
+                </div>""",
+                unsafe_allow_html=True
             )
 
 
@@ -876,6 +944,10 @@ def render_message(msg: dict, idx: int):
                             st.toast("Evaluation still running. Please wait a second and try again.", icon="⏳")
 
                 render_sources(msg["chunks"], chunk_evaluations=evals)
+
+                # Render RAG Triad summary if available for admin
+                if st.session_state.get("role") == "admin" and evals and isinstance(evals, dict) and "triad" in evals:
+                    render_rag_triad_ui(evals["triad"])
 
             # Feedback + star
             if qid:

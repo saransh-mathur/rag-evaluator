@@ -420,3 +420,102 @@ def evaluate_chunks_relevance(
                 "reason": f"Evaluation unavailable (error: {str(e)})."
             }
     return evaluations
+
+
+def _run_judge_prompt(prompt: str) -> dict:
+    """Helper to run a judge prompt and parse it using standard JSON or regex fallback."""
+    import json
+    import re
+    try:
+        response = _client().chat.completions.create(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=512,
+        )
+        raw = response.choices[0].message.content or ""
+        clean_raw = raw.strip()
+        if clean_raw.startswith("```json"):
+            clean_raw = clean_raw[7:]
+        if clean_raw.endswith("```"):
+            clean_raw = clean_raw[:-3]
+        clean_raw = clean_raw.strip()
+        
+        try:
+            return json.loads(clean_raw)
+        except Exception as json_err:
+            # Regex fallback for single score + reason format
+            # Format expected: { "score": 5, "reason": "..." }
+            score_match = re.search(r'"score"\s*:\s*(\d+)', clean_raw)
+            reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', clean_raw)
+            if score_match:
+                return {
+                    "score": int(score_match.group(1)),
+                    "reason": reason_match.group(1) if reason_match else "No explanation provided."
+                }
+            raise json_err
+    except Exception as e:
+        print(f"[DEBUG] Judge execution failed: {e}")
+        return {
+            "score": 3,
+            "reason": f"Evaluation failed: {str(e)}"
+        }
+
+
+def evaluate_rag_triad(question: str, answer: str, context: str) -> dict:
+    """
+    Evaluate the full RAG Triad (Faithfulness, Answer Relevance, Context Recall)
+    using separate LLM prompts.
+    """
+    # Trim context to avoid blowing up model max token limit
+    if len(context) > 4000:
+        context = context[:4000] + "... [truncated]"
+        
+    faithfulness_prompt = (
+        f"You are an AI quality judge evaluating RAG answers.\n"
+        f"Context:\n{context}\n\n"
+        f"Generated Answer:\n{answer}\n\n"
+        f"Rate the faithfulness of the generated answer to the provided context. An answer is faithful if it contains no facts, claims, or information that cannot be directly derived from the context.\n"
+        f"Assign a score between 1 (totally unfaithful, contains hallucinations) and 5 (completely faithful, grounded perfectly in context).\n"
+        f"Respond ONLY with a JSON object in this exact format:\n"
+        f"{{\n"
+        f"  \"score\": 5,\n"
+        f"  \"reason\": \"Explain why in 1 sentence.\"\n"
+        f"}}\n"
+        f"Do not add any preamble, markdown code blocks, or extra text. Return valid JSON only."
+    )
+    
+    relevance_prompt = (
+        f"You are an AI quality judge evaluating RAG answers.\n"
+        f"Question:\n{question}\n\n"
+        f"Generated Answer:\n{answer}\n\n"
+        f"Rate the relevance of the generated answer to the question. The answer is relevant if it directly addresses the question asked, without adding irrelevant chatter or ignoring details.\n"
+        f"Assign a score between 1 (completely irrelevant) and 5 (directly and fully answers the question).\n"
+        f"Respond ONLY with a JSON object in this exact format:\n"
+        f"{{\n"
+        f"  \"score\": 5,\n"
+        f"  \"reason\": \"Explain why in 1 sentence.\"\n"
+        f"}}\n"
+        f"Do not add any preamble, markdown code blocks, or extra text. Return valid JSON only."
+    )
+    
+    recall_prompt = (
+        f"You are an AI quality judge evaluating RAG retrieval.\n"
+        f"Question:\n{question}\n\n"
+        f"Retrieved Context Chunks:\n{context}\n\n"
+        f"Rate the context recall. Recall is high if the retrieved chunks contain all the necessary details required to formulate a complete answer to the question.\n"
+        f"Assign a score between 1 (completely irrelevant chunks, missing all key facts) and 5 (highly relevant chunks containing all facts).\n"
+        f"Respond ONLY with a JSON object in this exact format:\n"
+        f"{{\n"
+        f"  \"score\": 5,\n"
+        f"  \"reason\": \"Explain why in 1 sentence.\"\n"
+        f"}}\n"
+        f"Do not add any preamble, markdown code blocks, or extra text. Return valid JSON only."
+    )
+    
+    return {
+        "faithfulness": _run_judge_prompt(faithfulness_prompt),
+        "answer_relevance": _run_judge_prompt(relevance_prompt),
+        "context_recall": _run_judge_prompt(recall_prompt)
+    }
+

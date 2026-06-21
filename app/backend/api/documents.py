@@ -250,10 +250,15 @@ async def upload_document(
             user_ids_map={c.id: user_id for c in db_chunks}
         )
 
-        # Generate summary asynchronously — doesn't block the upload response
-        background_tasks.add_task(
-            _generate_summary_bg, doc.id, text, file.filename
-        )
+        # Generate summary asynchronously via Celery — doesn't block the upload response
+        try:
+            from tasks import generate_document_summary_task
+            generate_document_summary_task.delay(doc.id, text, file.filename)
+        except Exception as e:
+            logger.warning(f"Failed to queue Celery summary task: {e}, falling back to background task")
+            background_tasks.add_task(
+                _generate_summary_bg, doc.id, text, file.filename
+            )
 
         return {
             "document_id":    doc.id,

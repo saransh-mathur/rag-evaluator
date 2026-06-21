@@ -3,12 +3,15 @@
 An interactive **RAG (Retrieval-Augmented Generation)** system with user document uploads, vector search, and LLM responses. Ask questions about your documents using local AI models or cloud APIs like Google Gemini!
 
 **Key Features:**
-- 📤 Upload documents (markdown, text files)
-- 🔍 Vector search with PostgreSQL pgvector
-- 🤖 Generate answers using local LLMs (Ollama) or Google Gemini
-- 💬 Interactive chat interface (Streamlit)
-- 📚 See retrieved sources with similarity scores
-- 🔐 Flexible privacy — run 100% locally or connect to cloud APIs
+- 📤 **Upload Documents** — PDF (native & scanned PDF via OCR), plain text, and markdown.
+- 🔍 **Hybrid Vector Search** — pgvector/FAISS cosine search combined with BM25 keyword retrieval using Reciprocal Rank Fusion (RRF).
+- 🤖 **Streaming Responses** — High-quality streaming answers via local LLMs (Ollama) or Google Gemini.
+- 🔐 **Multi-User Authentication & Auto-login** — Secure user accounts with password hashing (SHA-256), roles (Admin/User), custom instructions, and URL session persistence across page refreshes.
+- 🔄 **Distributed Task Queue (Celery + Redis)** — Non-blocking processing of CPU/GPU-heavy tasks (document summaries and RAG Triad evaluations) running on background workers with local thread fallbacks.
+- 📊 **RAG Triad & Chunk Relevance Evaluations** — Admin-only visual dashboards assessing RAG performance (Faithfulness, Answer Relevance, Context Recall) alongside chunk relevance ratings.
+- 💬 **Interactive presentation layer** — Sleek Streamlit front-end featuring multi-session management, telemetry logging charts, and admin user account consoles.
+
+---
 
 ## How It Works
 
@@ -288,6 +291,45 @@ Press `Ctrl+C` in each terminal to stop:
 1. Frontend (Streamlit)
 2. Backend (FastAPI)
 3. Ollama (optional, can leave running)
+
+---
+
+## Distributed Processing & RAG Triad Services
+
+To handle document ingestion and quality evaluation tasks efficiently, the system integrates a Celery worker pool backed by a Redis broker:
+
+### Service Configuration & Port Mapping
+* **PostgreSQL Database:** Port `5432`
+* **FastAPI Backend REST/SSE API:** Port `8000`
+* **Streamlit UI Console:** Port `8501`
+* **Redis Broker:** Port `6379`
+* **Ollama (Local LLMs):** Port `11434`
+
+### Running the Ecosystem
+
+1. **Spin up the Redis Message Broker:**
+   Ensure Docker is active, then launch the Redis broker:
+   ```bash
+   docker run -d --name rag-redis -p 6379:6379 redis:alpine
+   ```
+   *(If the container is already created, start it using: `docker start rag-redis`)*
+
+2. **Start the FastAPI Backend Server:**
+   ```bash
+   ./run_backend.sh
+   ```
+
+3. **Launch the Celery Worker Process:**
+   Navigate into the `/app/backend` directory and start the Celery worker:
+   ```bash
+   cd app/backend
+   ../../.venv/bin/celery -A celery_app worker --loglevel=info
+   ```
+
+4. **Launch the Streamlit Presentation Console:**
+   ```bash
+   ./run_frontend.sh
+   ```
 
 ---
 
